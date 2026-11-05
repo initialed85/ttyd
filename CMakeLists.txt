@@ -4,7 +4,12 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 project(ttyd VERSION 1.7.7 LANGUAGES C)
 
-set(TTYD_VERSION "${PROJECT_VERSION}")
+# slopyphus: this is initialed85/ttyd, a fork, and the binary has to say so. Inside a running agent the
+# only evidence of which ttyd is serving a pane is `ttyd --version`, and the distinction is the whole point
+# of vendoring the source: apt's package and this build are both 1.7.7 and differ only in what we change.
+# A build from a git checkout appends the commit (below), which is correct but not enough to tell a fork
+# from upstream at a glance, so the suffix is explicit. Upstream: drop this line, nothing depends on it.
+set(TTYD_VERSION "${PROJECT_VERSION}-slopyphus")
 
 include(GetGitVersion)
 get_git_version(GIT_VERSION SEM_VER)
