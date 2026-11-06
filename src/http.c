@@ -49,6 +49,17 @@ static bool accept_gzip(struct lws *wsi) {
   return len > 0 && strstr(buf, "gzip") != NULL;
 }
 
+// The document ttyd serves *is* the client: the terminal bundle is inlined into it, and the file is compiled
+// into the binary, so its content changes exactly when the image does - and there is nothing a browser could
+// use to ask whether what it holds is still current, because an embedded resource has no Last-Modified, no
+// ETag and no conditional path. Without an instruction to the contrary a tab opened before a rollout keeps
+// running the bundle it cached, which from the pane looks identical to the fix never having been deployed.
+// no-store is the only honest thing to say here, and it also keeps the response out of the back/forward
+// cache, which is the other way a stale terminal survives a reload.
+static int add_no_store(struct lws *wsi, unsigned char **p, unsigned char *end) {
+  return lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CACHE_CONTROL, (unsigned char *)"no-store", 8, p, end);
+}
+
 static bool uncompress_html(char **output, size_t *output_len) {
   if (html_cache == NULL || html_cache_len == 0) {
     z_stream stream;
@@ -148,6 +159,13 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
       const char *content_type = "text/html";
       if (server->index != NULL) {
+        // Left on the upstream call. The index-file variant hands header writing to lws, whose signature in
+        // the libwebsockets this image builds against is `(wsi, fs_path, content_type, const char
+        // *other_headers, int other_headers_len)` - one raw blob whose exact accepted shape is not
+        // documented, and guessing it here would put an unverified format into a path that serves a page. No
+        // ttyd in this deployment uses --index (docker-entrypoint.sh serves the embedded document), so the
+        // no-store guarantee above is the one that actually applies; if a custom index is ever introduced,
+        // its cache headers have to be settled against the lws version in the Dockerfile.
         int n = lws_serve_http_file(wsi, server->index, content_type, NULL, 0);
         if (n < 0 || (n > 0 && lws_http_transaction_completed(wsi))) return 1;
       } else {
@@ -155,7 +173,8 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
         size_t output_len = index_html_len;
         if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
             lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, (const unsigned char *)content_type, 9, &p,
-                                         end))
+                                         end) ||
+            add_no_store(wsi, &p, end))
           return 1;
 #ifdef LWS_WITH_HTTP_STREAM_COMPRESSION
         if (!uncompress_html(&output, &output_len)) return 1;
