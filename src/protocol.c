@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <errno.h>
 #include <json.h>
 #include <libwebsockets.h>
@@ -5,13 +6,264 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "pty.h"
 #include "server.h"
 #include "utils.h"
 
 // initial message list
-static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
+static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES, SET_CAPABILITIES};
+
+// Uploads only make sense where the client may already write to the terminal: typing a path into a
+// readonly pane would be refused anyway, and it would still put bytes on the server's disk.
+static bool uploads_available(void) { return !server->upload_disabled && server->writable; }
+
+static void upload_dir_path(char *dir, size_t len) {
+  char cwd[512];
+  const char *base = server->cwd;
+  if (base == NULL || strlen(base) == 0) {
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
+      cwd[0] = '\0';
+    base = cwd;
+  }
+  snprintf(dir, len, "%s/%s", base, server->upload_dir);
+}
+
+// mkdir -p, because a fresh workspace has no upload directory until the first paste.
+static bool ensure_directories(const char *path) {
+  char copy[512];
+  snprintf(copy, sizeof(copy), "%s", path);
+
+  for (char *p = copy + 1; *p != '\0'; p++) {
+    if (*p != '/') continue;
+    *p = '\0';
+    if (mkdir(copy, 0755) != 0 && errno != EEXIST) return false;
+    *p = '/';
+  }
+
+  if (mkdir(copy, 0755) != 0 && errno != EEXIST) return false;
+  return true;
+}
+
+// Only a basename survives: a browser can hand over anything the drop source called a name, and the
+// name is concatenated straight into a path. Everything outside [A-Za-z0-9._-] becomes '-', leading
+// dots are dropped so a name can never become ".", ".." or a hidden-file surprise.
+static bool sanitize_file_name(const char *raw, char *out, size_t out_len) {
+  const char *base = raw;
+  for (const char *p = raw; *p != '\0'; p++) {
+    if (*p == '/' || *p == '\\') base = p + 1;
+  }
+
+  char *o = out;
+  char *end = out + out_len - 1;
+  for (const char *p = base; *p != '\0' && o < end; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (isalnum(c) || c == '.' || c == '-' || c == '_')
+      *o++ = (char)c;
+    else
+      *o++ = '-';
+  }
+  *o = '\0';
+
+  char *trimmed = out;
+  while (*trimmed == '.') trimmed++;
+  if (trimmed != out) memmove(out, trimmed, strlen(trimmed) + 1);
+
+  return out[0] != '\0';
+}
+
+static void upload_close(struct pss_tty *pss, bool keep_file) {
+  if (pss->up_file != NULL) {
+    fclose(pss->up_file);
+    pss->up_file = NULL;
+  }
+  // The path is cleared together with the file. A result frame that says ok:false and still names a path
+  // is a trap: the client would have a filename for something that no longer exists, and the client is
+  // the component that decides what to type into the pane.
+  if (!keep_file && pss->up_path[0] != '\0') {
+    unlink(pss->up_path);
+    pss->up_path[0] = '\0';
+  }
+}
+
+static void send_upload_result(struct pss_tty *pss, bool ok, const char *reason) {
+  char payload[768];
+  int n = snprintf(payload, sizeof(payload), "{\"ok\":%s,\"bytes\":%ld,\"path\":\"%s\",\"reason\":\"%s\"}",
+                   ok ? "true" : "false", pss->up_received, pss->up_path, reason != NULL ? reason : "");
+  if (n <= 0) return;
+
+  char *message = xmalloc(LWS_PRE + 1 + (size_t)n);
+  char *ptr = message + LWS_PRE;
+  *ptr = UPLOAD_RESULT;
+  memcpy(ptr + 1, payload, (size_t)n);
+
+  if (lws_write(pss->wsi, (unsigned char *)ptr, (size_t)n + 1, LWS_WRITE_BINARY) < n + 1)
+    lwsl_err("write UPLOAD_RESULT to WS\n");
+
+  free(message);
+}
+
+static void upload_begin(struct pss_tty *pss, const char *json, size_t len) {
+  pss->up_path[0] = '\0';
+  pss->up_size = 0;
+  pss->up_received = 0;
+  pss->up_failed = false;
+
+  if (pss->up_file != NULL) {
+    upload_close(pss, false);
+    send_upload_result(pss, false, "previous upload abandoned");
+  }
+
+  if (!uploads_available()) {
+    send_upload_result(pss, false, server->upload_disabled ? "uploads are disabled" : "pane is readonly");
+    return;
+  }
+
+  json_tokener *tok = json_tokener_new();
+  json_object *obj = json_tokener_parse_ex(tok, json, (int)len);
+  json_object *o = NULL;
+  const char *name = NULL;
+  long size = 0;
+  if (obj != NULL && json_object_object_get_ex(obj, "name", &o)) name = json_object_get_string(o);
+  if (obj != NULL && json_object_object_get_ex(obj, "size", &o)) size = (long)json_object_get_int64(o);
+  json_object_put(obj);
+  json_tokener_free(tok);
+
+  if (name == NULL || size <= 0) {
+    send_upload_result(pss, false, "expected a name and a positive size");
+    return;
+  }
+  if (size > server->upload_max_bytes) {
+    send_upload_result(pss, false, "file is larger than the upload limit");
+    return;
+  }
+
+  char safe_name[128];
+  if (!sanitize_file_name(name, safe_name, sizeof(safe_name))) {
+    send_upload_result(pss, false, "file name has nothing usable in it");
+    return;
+  }
+
+  char dir[512];
+  upload_dir_path(dir, sizeof(dir));
+  if (!ensure_directories(dir)) {
+    lwsl_err("uploads: mkdir %s: %s\n", dir, strerror(errno));
+    send_upload_result(pss, false, "could not create the upload directory");
+    return;
+  }
+
+  char stamp[32];
+  time_t now = time(NULL);
+  struct tm tm;
+  localtime_r(&now, &tm);
+  strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+
+  // A paste and a drop of the same file in the same second must not clobber each other, so the open
+  // is exclusive and a counter walks the collisions.
+  for (int attempt = 0; attempt < 100; attempt++) {
+    if (attempt == 0)
+      snprintf(pss->up_path, sizeof(pss->up_path), "%s/%s-%s", dir, stamp, safe_name);
+    else
+      snprintf(pss->up_path, sizeof(pss->up_path), "%s/%s-%s-%d", dir, stamp, safe_name, attempt);
+
+    pss->up_file = fopen(pss->up_path, "wx");
+    if (pss->up_file != NULL) break;
+    if (errno != EEXIST) {
+      lwsl_err("uploads: open %s: %s\n", pss->up_path, strerror(errno));
+      pss->up_path[0] = '\0';
+      send_upload_result(pss, false, "could not open the upload file");
+      return;
+    }
+  }
+
+  if (pss->up_file == NULL) {
+    pss->up_path[0] = '\0';
+    send_upload_result(pss, false, "too many files with that name in this second");
+    return;
+  }
+
+  pss->up_size = size;
+  lwsl_notice("upload started: %s (%ld bytes)\n", pss->up_path, size);
+}
+
+static void upload_data(struct pss_tty *pss, const char *b64, size_t len) {
+  if (pss->up_file == NULL) return;  // a transfer the client never began, or one already refused
+
+  size_t cap = len / 4 * 3 + 4;
+  char *decoded = xmalloc(cap);
+  int n = lws_b64_decode_string(b64, decoded, cap);
+  if (n <= 0) {
+    free(decoded);
+    pss->up_failed = true;
+    upload_close(pss, false);
+    send_upload_result(pss, false, "upload chunk was not valid base64");
+    return;
+  }
+
+  if ((long)n > pss->up_size - pss->up_received) {
+    // Named numbers, because "the client declared X and sent Y" is the difference between a client bug,
+    // a proxy splitting a frame, and a size that changed between the paste and the transfer - and without
+    // them the only evidence is a refusal the client prints and nobody can interpret.
+    lwsl_err("uploads: a %ld byte chunk overran a %ld byte declaration (%ld written so far to %s)\n", (long)n,
+             pss->up_size - pss->up_received, pss->up_received, pss->up_path);
+    free(decoded);
+    pss->up_failed = true;
+    upload_close(pss, false);
+    send_upload_result(pss, false, "more bytes arrived than the client declared");
+    return;
+  }
+
+  size_t written = fwrite(decoded, 1, (size_t)n, pss->up_file);
+  free(decoded);
+  pss->up_received += (long)written;
+
+  if (written != (size_t)n) {
+    pss->up_failed = true;
+    upload_close(pss, false);
+    send_upload_result(pss, false, "the workspace refused the write");
+  }
+}
+
+static void upload_commit(struct pss_tty *pss) {
+  if (pss->up_file == NULL) return;  // nothing in flight, and no error to report for it
+
+  bool complete = !pss->up_failed && pss->up_received == pss->up_size;
+  fclose(pss->up_file);
+  pss->up_file = NULL;
+
+  if (!complete) {
+    upload_close(pss, false);
+    pss->up_received = 0;
+    send_upload_result(pss, false, "the transfer stopped before the declared size");
+    return;
+  }
+
+  lwsl_notice("upload written: %s (%ld bytes)\n", pss->up_path, pss->up_received);
+  send_upload_result(pss, true, "");
+
+  // The whole point of the detour through the websocket: the path is handed to the program in the
+  // pane as if the user had typed it, which is how a TUI such as Pi gets a file it can open.
+  if (pss->process != NULL && server->writable) {
+    size_t path_len = strlen(pss->up_path);
+    // A space follows the path. A paste is nearly always the start of a sentence rather than its end -
+    // "look at <path> and tell me what is wrong" - and without the separator the user's own typing gets
+    // glued onto the filename, which is the kind of thing that reads as a broken feature the first time
+    // it happens.
+    char *typed = xmalloc(path_len + 1);
+    memcpy(typed, pss->up_path, path_len);
+    typed[path_len] = ' ';
+    int err = pty_write(pss->process, pty_buf_init(typed, path_len + 1));
+    if (err) lwsl_err("uploads: pty_write: %s (%s)\n", uv_err_name(err), uv_strerror(err));
+  }
+
+  pss->up_received = 0;
+  pss->up_path[0] = '\0';
+}
+
 
 static int send_initial_message(struct lws *wsi, int index) {
   unsigned char message[LWS_PRE + 1 + 4096];
@@ -28,6 +280,13 @@ static int send_initial_message(struct lws *wsi, int index) {
     case SET_PREFERENCES:
       n = sprintf((char *)p, "%c%s", cmd, server->prefs_json);
       break;
+    case SET_CAPABILITIES: {
+      char dir[512];
+      upload_dir_path(dir, sizeof(dir));
+      n = sprintf((char *)p, "%c{\"upload\":%s,\"uploadMaxBytes\":%ld,\"uploadDir\":\"%s\"}", cmd,
+                  uploads_available() ? "true" : "false", server->upload_max_bytes, dir);
+      break;
+    }
     default:
       break;
   }
@@ -282,13 +541,20 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
     case LWS_CALLBACK_RECEIVE:
       if (pss->buffer == NULL) {
-        pss->buffer = xmalloc(len);
+        // One byte more than the message, and a terminator written at the end of it. A command handler
+        // that takes the payload as a C string has no length to be given: the base64 decoder reads to a
+        // NUL. Without the terminator a frame that happens to be followed in the buffer by the next frame
+        // decodes a few bytes of *that*, which looks like a client sending more than it declared. Measured
+        // with uploads sent back to back, the way a browser sends them.
+        pss->buffer = xmalloc(len + 1);
         pss->len = len;
         memcpy(pss->buffer, in, len);
+        pss->buffer[pss->len] = '\0';
       } else {
-        pss->buffer = xrealloc(pss->buffer, pss->len + len);
+        pss->buffer = xrealloc(pss->buffer, pss->len + len + 1);
         memcpy(pss->buffer + pss->len, in, len);
         pss->len += len;
+        pss->buffer[pss->len] = '\0';
       }
 
       const char command = pss->buffer[0];
@@ -324,6 +590,22 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           break;
         case RESUME:
           pty_resume(pss->process);
+          break;
+        case UPLOAD_BEGIN:
+          upload_begin(pss, pss->buffer + 1, pss->len - 1);
+          break;
+        case UPLOAD_DATA:
+          upload_data(pss, pss->buffer + 1, pss->len - 1);
+          break;
+        case UPLOAD_COMMIT:
+          upload_commit(pss);
+          break;
+        case UPLOAD_ABORT:
+          // The client sends this when it gives up mid-transfer. Silence is deliberate: either there
+          // is something to discard, or the server already reported the failure.
+          upload_close(pss, false);
+          pss->up_path[0] = '\0';
+          pss->up_received = 0;
           break;
         case JSON_DATA:
           if (pss->process != NULL) break;
@@ -366,6 +648,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       lwsl_notice("WS closed from %s, clients: %d\n", pss->address, server->client_count);
       if (pss->buffer != NULL) free(pss->buffer);
       if (pss->pty_buf != NULL) pty_buf_free(pss->pty_buf);
+      // A client that drops mid-transfer must not leave a half-written image in the workspace.
+      if (pss->up_file != NULL) upload_close(pss, false);
       for (int i = 0; i < pss->argc; i++) {
         free(pss->args[i]);
       }

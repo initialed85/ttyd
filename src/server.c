@@ -79,6 +79,8 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"once", no_argument, NULL, 'o'},
                                         {"exit-no-conn", no_argument, NULL, 'q'},
                                         {"browser", no_argument, NULL, 'B'},
+                                        {"disable-upload", no_argument, NULL, 1001},
+                                        {"upload-max-bytes", required_argument, NULL, 1002},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
@@ -113,6 +115,8 @@ static void print_help() {
           "    -B, --browser           Open terminal with the default system browser\n"
           "    -I, --index             Custom index.html path\n"
           "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
+          "        --disable-upload    Refuse browser file uploads (paste and drag-and-drop) into the working directory\n"
+          "        --upload-max-bytes  Size limit per uploaded file in bytes (default: 8388608, max: 67108864)\n"
 #if LWS_LIBRARY_VERSION_NUMBER >= 4000000
           "    -P, --ping-interval     Websocket ping interval(sec) (default: 5)\n"
 #endif
@@ -155,6 +159,10 @@ static void print_config() {
   if (server->exit_no_conn) lwsl_notice("  exit_no_conn: true\n");
   if (server->index != NULL) lwsl_notice("  custom index.html: %s\n", server->index);
   if (server->cwd != NULL) lwsl_notice("  working directory: %s\n", server->cwd);
+  if (server->upload_disabled)
+    lwsl_notice("  browser uploads: disabled\n");
+  else
+    lwsl_notice("  browser uploads: %s (max %ld bytes per file)\n", server->upload_dir, server->upload_max_bytes);
   if (!server->writable) lwsl_notice("The --writable option is not set, will start in readonly mode");
 }
 
@@ -169,6 +177,9 @@ static struct server *server_new(int argc, char **argv, int start) {
   ts->sig_code = SIGHUP;
   sprintf(ts->terminal_type, "%s", "xterm-256color");
   get_sig_name(ts->sig_code, ts->sig_name, sizeof(ts->sig_name));
+  // Defaults are set before the early return so a server with no command still has sane limits.
+  ts->upload_max_bytes = TTYD_UPLOAD_MAX_BYTES_DEFAULT;
+  sprintf(ts->upload_dir, "%s", TTYD_UPLOAD_DIR_DEFAULT);
   if (start == argc) return ts;
 
   int cmd_argc = argc - start;
@@ -376,6 +387,18 @@ int main(int argc, char **argv) {
       case 'B':
         browser = true;
         break;
+      case 1001:
+        server->upload_disabled = true;
+        break;
+      case 1002: {
+        int limit = parse_int("upload-max-bytes", optarg);
+        if (limit < 1 || limit > TTYD_UPLOAD_MAX_BYTES_LIMIT) {
+          fprintf(stderr, "ttyd: --upload-max-bytes must be between 1 and %d\n", TTYD_UPLOAD_MAX_BYTES_LIMIT);
+          return -1;
+        }
+        server->upload_max_bytes = limit;
+        break;
+      }
       case 'p':
         info.port = parse_int("port", optarg);
         if (info.port < 0) {

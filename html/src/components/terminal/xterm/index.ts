@@ -27,14 +27,28 @@ enum Command {
     OUTPUT = '0',
     SET_WINDOW_TITLE = '1',
     SET_PREFERENCES = '2',
+    SET_CAPABILITIES = '3',
+    UPLOAD_RESULT = '4',
 
     // client side
     INPUT = '0',
     RESIZE_TERMINAL = '1',
     PAUSE = '2',
     RESUME = '3',
+    UPLOAD_BEGIN = '4',
+    UPLOAD_DATA = '5',
+    UPLOAD_COMMIT = '6',
+    UPLOAD_ABORT = '7',
 }
 type Preferences = ITerminalOptions & ClientOptions;
+
+// What the server said it is willing to do. Reported once per connection, before any of it is offered
+// in the UI, so a readonly pane does not pretend a dropped file will land somewhere.
+export interface Capabilities {
+    upload: boolean;
+    uploadMaxBytes: number;
+    uploadDir: string;
+}
 
 export type RendererType = 'dom' | 'canvas' | 'webgl';
 
@@ -46,6 +60,7 @@ export interface ClientOptions {
     enableTrzsz: boolean;
     enableSixel: boolean;
     enableShiftEnter: boolean;
+    enableUpload: boolean;
     titleFixed?: string;
     isWindows: boolean;
     trzszDragInitTimeout: number;
@@ -97,9 +112,19 @@ const parseOsc52 = (data: string): Osc52Request => {
     }
 };
 
-function addEventListener(target: EventTarget, type: string, listener: EventListener): IDisposable {
-    target.addEventListener(type, listener);
-    return toDisposable(() => target.removeEventListener(type, listener));
+function addEventListener(target: EventTarget, type: string, listener: EventListener, capture = false): IDisposable {
+    target.addEventListener(type, listener, capture);
+    return toDisposable(() => target.removeEventListener(type, listener, capture));
+}
+
+// btoa over one huge string blows the call stack through String.fromCharCode, so encode in blocks.
+function bytesToBase64(bytes: Uint8Array): string {
+    let binary = '';
+    const block = 8192;
+    for (let i = 0; i < bytes.length; i += block) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + block));
+    }
+    return btoa(binary);
 }
 
 export class Xterm {
@@ -127,6 +152,13 @@ export class Xterm {
     // True before the websocket reports preferences, so the first keystroke after a page load behaves
     // the same as every one after it.
     private enableShiftEnter = true;
+    // Reported by the server once per connection. Uploads need a writable pane and a server that has
+    // not been started with --disable-upload.
+    private capabilities: Capabilities = { upload: false, uploadMaxBytes: 0, uploadDir: '' };
+    // -t enableUpload=false hands drag-and-drop back to trzsz for panes that really do run trz(1).
+    private enableUpload = true;
+    private uploading = false;
+    private pendingUpload?: { settle: (ok: boolean) => void };
 
     private writeFunc = (data: ArrayBuffer) => this.writeData(new Uint8Array(data));
 
@@ -150,7 +182,15 @@ export class Xterm {
 
     @bind
     public sendFile(files: FileList) {
-        this.zmodemAddon?.sendFile(files);
+        // The toolbar's "Choose files…" used to mean start a trzsz transfer, which types trz into the
+        // pane and needs a trz(1) listening for it there. Under a full-screen TUI that is dead on
+        // arrival, so the picker uses the upload path whenever the pane supports it and zmodem keeps
+        // the old behaviour when it does not.
+        if (this.uploadsReady()) {
+            void this.uploadFiles(files);
+        } else {
+            this.zmodemAddon?.sendFile(files);
+        }
     }
 
     @bind
@@ -164,6 +204,49 @@ export class Xterm {
         } catch (e) {
             console.error(`[ttyd] fetch ${this.options.tokenUrl}: `, e);
         }
+    }
+
+    @bind
+    private onPaste(event: ClipboardEvent) {
+        const files = event.clipboardData?.files;
+        // A clipboard that carries text and no files is xterm's business, not ours.
+        if (!files || files.length === 0) return;
+        if (!this.uploadsReady()) return;
+        event.preventDefault();
+        event.stopPropagation();
+        void this.uploadFiles(files);
+    }
+
+    @bind
+    private onDragOver(event: DragEvent) {
+        if (!this.dragHasFiles(event) || !this.uploadsReady()) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.overlayAddon.showOverlay('\u2193 file', 100);
+    }
+
+    @bind
+    private onDrop(event: DragEvent) {
+        const files = event.dataTransfer?.files;
+        if (!files || files.length === 0) return;
+        if (!this.uploadsReady()) return;
+        event.preventDefault();
+        event.stopPropagation();
+        void this.uploadFiles(files);
+    }
+
+    private dragHasFiles(event: DragEvent): boolean {
+        const types = event.dataTransfer?.types;
+        if (!types) return false;
+        for (const type of Array.from(types)) {
+            if (type === 'Files') return true;
+        }
+        return false;
+    }
+
+    private uploadsReady(): boolean {
+        if (!this.capabilities.upload || !this.enableUpload) return false;
+        return this.socket?.readyState === WebSocket.OPEN;
     }
 
     @bind
@@ -224,6 +307,21 @@ export class Xterm {
                 this.overlayAddon?.showOverlay('\u2702', 200);
             })
         );
+
+        // A pasted or dropped file is not keystrokes, so it does not travel as INPUT: the bytes go up
+        // as upload frames, the server writes them under the pane's working directory, and the saved
+        // path arrives in the terminal as though the user had typed it. That is what lets a TUI such
+        // as Pi open an image with no trz(1) helper running inside the pane.
+        //
+        // Capturing on an ancestor is deliberate. xterm.js binds 'paste' on both its helper textarea
+        // and its own element, and trzsz binds dragover/drop on that same element; a listener added
+        // later on one of those nodes would run after clipboard text had already been written to the
+        // pty. An ancestor in the capture phase always runs first, and stopping propagation then keeps
+        // the event away from them.
+        const fileTarget = terminal.element?.parentElement ?? document.body;
+        register(addEventListener(fileTarget, 'paste', this.onPaste as EventListener, true));
+        register(addEventListener(fileTarget, 'dragover', this.onDragOver as EventListener, true));
+        register(addEventListener(fileTarget, 'drop', this.onDrop as EventListener, true));
         // terminal.parser is public API (xterm.js typings: ITerminal.parser -> IParser), so OSC 52
         // lives here rather than in a forked xterm.
         register(terminal.parser.registerOscHandler(52, this.onOsc52));
@@ -378,6 +476,100 @@ export class Xterm {
         }
     }
 
+    // Uploads are one at a time per connection: the server keeps a single transfer slot per client,
+    // and a program in the pane can only be handed one path at a time in a readable order.
+    @bind
+    private async uploadFiles(files: FileList | File[]) {
+        if (this.uploading) {
+            console.warn('[ttyd] pane upload ignored: one is already running');
+            this.overlayAddon.showOverlay('uploading\u2026', 300);
+            return;
+        }
+        this.uploading = true;
+        const limit = this.capabilities.uploadMaxBytes;
+        try {
+            for (const file of Array.from(files)) {
+                if (file.size <= 0) {
+                    console.warn(`[ttyd] pane upload skipped an empty file: ${file.name}`);
+                    continue;
+                }
+                if (limit > 0 && file.size > limit) {
+                    console.warn(`[ttyd] pane upload refused: ${file.name} is ${file.size} bytes, limit ${limit}`);
+                    this.overlayAddon.showOverlay('too large', 500);
+                    continue;
+                }
+                const ok = await this.uploadFile(file);
+                // The pane refused or dropped the transfer; do not keep pushing bytes at it.
+                if (!ok) break;
+            }
+        } finally {
+            this.uploading = false;
+        }
+    }
+
+    private uploadFile(file: File): Promise<boolean> {
+        const socket = this.socket;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.resolve(false);
+
+        let settle: (ok: boolean) => void = () => undefined;
+        const result = new Promise<boolean>(resolve => (settle = resolve));
+        const transfer = { settled: false, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+        const finish = (ok: boolean) => {
+            if (transfer.settled) return;
+            transfer.settled = true;
+            if (transfer.timer) clearTimeout(transfer.timer);
+            this.pendingUpload = undefined;
+            settle(ok);
+        };
+        this.pendingUpload = { settle: finish };
+        transfer.timer = setTimeout(() => {
+            console.warn(`[ttyd] pane upload timed out: ${file.name}`);
+            this.sendControl(Command.UPLOAD_ABORT);
+            finish(false);
+        }, 30000);
+
+        // 196608 is divisible by 3, so every chunk is a whole number of base64 groups and only the
+        // last one carries padding.
+        const chunk = 196608;
+        this.sendControl(Command.UPLOAD_BEGIN + JSON.stringify({ name: file.name, size: file.size }));
+
+        const sendChunks = async () => {
+            let offset = 0;
+            while (offset < file.size) {
+                if (this.pendingUpload === undefined || socket.readyState !== WebSocket.OPEN) {
+                    this.sendControl(Command.UPLOAD_ABORT);
+                    return finish(false);
+                }
+                const slice = file.slice(offset, offset + chunk);
+                const bytes = new Uint8Array(await slice.arrayBuffer());
+                this.sendControl(Command.UPLOAD_DATA + bytesToBase64(bytes));
+                offset += bytes.byteLength;
+                this.overlayAddon.showOverlay(`\u2191 ${Math.round((offset / file.size) * 100)}%`, 40);
+                // A websocket does not block on a slow reader, it only grows a send buffer, so wait
+                // rather than letting a big paste eat memory in the browser.
+                while (socket.bufferedAmount > 4 * 1024 * 1024 && socket.readyState === WebSocket.OPEN) {
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                }
+            }
+            // A result that arrived mid-transfer means the server already closed the file.
+            if (this.pendingUpload === undefined) return;
+            this.sendControl(Command.UPLOAD_COMMIT);
+        };
+        sendChunks().catch(e => {
+            console.error(`[ttyd] pane upload failed to read ${file.name}: ${e}`);
+            this.sendControl(Command.UPLOAD_ABORT);
+            finish(false);
+        });
+
+        return result;
+    }
+
+    private sendControl(command: string) {
+        const socket = this.socket;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(this.textEncoder.encode(command));
+    }
+
     @bind
     public connect() {
         this.socket = new WebSocket(this.options.wsUrl, ['tty']);
@@ -418,6 +610,10 @@ export class Xterm {
         const { refreshToken, connect, doReconnect, overlayAddon } = this;
         overlayAddon.showOverlay('Connection Closed');
         this.dispose();
+        // A socket that dies mid-transfer must not leave the client waiting for a result that can no
+        // longer arrive, nor hold the one-upload-at-a-time slot shut.
+        this.pendingUpload?.settle(false);
+        this.uploading = false;
 
         // 1000: CLOSE_NORMAL
         if (event.code !== 1000 && doReconnect) {
@@ -493,6 +689,31 @@ export class Xterm {
                     ...this.parseOptsFromUrlQuery(window.location.search),
                 } as Preferences);
                 break;
+            case Command.SET_CAPABILITIES: {
+                this.capabilities = {
+                    upload: false,
+                    uploadMaxBytes: 0,
+                    uploadDir: '',
+                    ...JSON.parse(textDecoder.decode(data)),
+                };
+                const where = this.capabilities.upload
+                    ? `to ${this.capabilities.uploadDir}`
+                    : 'not available on this pane';
+                console.log(`[ttyd] pane upload ${where}, limit ${this.capabilities.uploadMaxBytes} bytes`);
+                break;
+            }
+            case Command.UPLOAD_RESULT: {
+                const result = JSON.parse(textDecoder.decode(data));
+                this.pendingUpload?.settle(result.ok === true);
+                if (result.ok) {
+                    console.log('[ttyd] pane upload written to', result.path, `${result.bytes} bytes`);
+                    this.overlayAddon.showOverlay('\u2191 saved', 400);
+                } else {
+                    console.warn(`[ttyd] pane upload failed: ${result.reason}`);
+                    this.overlayAddon.showOverlay('upload failed', 500);
+                }
+                break;
+            }
             default:
                 console.warn(`[ttyd] unknown command: ${cmd}`);
                 break;
@@ -558,6 +779,10 @@ export class Xterm {
                 case 'enableShiftEnter':
                     this.enableShiftEnter = value !== false;
                     console.log(`[ttyd] Shift+Enter -> newline ${this.enableShiftEnter ? 'enabled' : 'disabled'}`);
+                    break;
+                case 'enableUpload':
+                    this.enableUpload = value !== false;
+                    if (!this.enableUpload) console.log('[ttyd] browser paste and drag-and-drop disabled');
                     break;
                 case 'titleFixed':
                     if (!value || value === '') return;
