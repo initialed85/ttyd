@@ -69,6 +69,33 @@ function toDisposable(f: () => void): IDisposable {
     return { dispose: f };
 }
 
+interface Osc52Request {
+    // "?" is a request for the clipboard contents, which this client does not answer.
+    query: boolean;
+    text: string;
+}
+
+// tmux hands a copy-mode selection to the outer terminal as OSC 52. xterm.js 5.4 parses OSC but
+// registers no handler for 52, so the sequence tmux emits when a mouse drag ends is dropped and
+// nothing reaches the clipboard. tmux sends an empty selection code (";;data"), Vim and Neovim send
+// "c;data" or "p;data", so the code field is only inspected for the query form.
+const parseOsc52 = (data: string): Osc52Request => {
+    const separator = data.indexOf(';');
+    const codes = separator < 0 ? data : data.slice(0, separator);
+    const payload = separator < 0 ? '' : data.slice(separator + 1);
+    if (codes.indexOf('?') >= 0) return { query: true, text: '' };
+    if (payload === '') return { query: false, text: '' };
+    try {
+        const bytes = Uint8Array.from(atob(payload.replace(/\s+/g, '')), c => c.charCodeAt(0));
+        // tmux copies whole lines with a trailing line break; pasting it back into a terminal
+        // would submit a prompt, so drop one trailing break.
+        return { query: false, text: new TextDecoder().decode(bytes).replace(/\r?\n$/, '') };
+    } catch (e) {
+        console.warn('[ttyd] malformed OSC 52 payload', e);
+        return { query: false, text: '' };
+    }
+};
+
 function addEventListener(target: EventTarget, type: string, listener: EventListener): IDisposable {
     target.addEventListener(type, listener);
     return toDisposable(() => target.removeEventListener(type, listener));
@@ -193,8 +220,53 @@ export class Xterm {
                 this.overlayAddon?.showOverlay('\u2702', 200);
             })
         );
+        // terminal.parser is public API (xterm.js typings: ITerminal.parser -> IParser), so OSC 52
+        // lives here rather than in a forked xterm.
+        register(terminal.parser.registerOscHandler(52, this.onOsc52));
         register(addEventListener(window, 'resize', () => fitAddon.fit()));
         register(addEventListener(window, 'beforeunload', this.onWindowUnload));
+    }
+
+    @bind
+    private onOsc52(data: string): boolean {
+        const { query, text } = parseOsc52(data);
+        if (query || text === '') return true;
+        this.copyToClipboard(text).then(copied => {
+            if (copied) this.overlayAddon.showOverlay('\u2702', 200);
+        });
+        return true;
+    }
+
+    // navigator.clipboard only exists in a secure context and a ttyd pane opened over plain http on a
+    // node address is not one, so keep the scratch textarea ttyd already relies on for xterm selections.
+    private async copyToClipboard(text: string): Promise<boolean> {
+        try {
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch (e) {
+            console.warn('[ttyd] navigator.clipboard.writeText failed', e);
+        }
+        try {
+            const scratch = document.createElement('textarea');
+            scratch.setAttribute('aria-hidden', 'true');
+            scratch.style.position = 'fixed';
+            scratch.style.top = '-1em';
+            scratch.style.opacity = '0';
+            scratch.value = text;
+            document.body.appendChild(scratch);
+            scratch.focus();
+            scratch.select();
+            const copied = document.execCommand('copy');
+            scratch.remove();
+            this.terminal.focus();
+            return copied;
+        } catch (e) {
+            console.warn('[ttyd] fallback clipboard copy failed', e);
+            this.terminal.focus();
+            return false;
+        }
     }
 
     @bind
