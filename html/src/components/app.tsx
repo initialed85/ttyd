@@ -16,6 +16,9 @@ const clientOptions = {
     enableZmodem: false,
     enableTrzsz: false,
     enableSixel: false,
+    // xterm.js evaluates Shift+Enter as plain Enter, so a pane needs the browser to translate it.
+    // See the onKey handler in ./terminal/xterm for why the translation is a newline.
+    enableShiftEnter: true,
     isWindows: false,
     unicodeVersion: '11',
 } as ClientOptions;

@@ -45,6 +45,7 @@ export interface ClientOptions {
     enableZmodem: boolean;
     enableTrzsz: boolean;
     enableSixel: boolean;
+    enableShiftEnter: boolean;
     titleFixed?: string;
     isWindows: boolean;
     trzszDragInitTimeout: number;
@@ -123,6 +124,9 @@ export class Xterm {
     private resizeOverlay = true;
     private reconnect = true;
     private doReconnect = true;
+    // True before the websocket reports preferences, so the first keystroke after a page load behaves
+    // the same as every one after it.
+    private enableShiftEnter = true;
 
     private writeFunc = (data: ArrayBuffer) => this.writeData(new Uint8Array(data));
 
@@ -223,8 +227,56 @@ export class Xterm {
         // terminal.parser is public API (xterm.js typings: ITerminal.parser -> IParser), so OSC 52
         // lives here rather than in a forked xterm.
         register(terminal.parser.registerOscHandler(52, this.onOsc52));
+        // xterm.js 5.4 has no extended-key support (no Kitty keyboard protocol), so the browser is the
+        // only place a Shift+Enter can be turned into something an application can use.
+        // There is no detach: attachCustomKeyEventHandler takes a function, not null, and Terminal.dispose
+        // takes the handler with it. The slot is single, and reconnects reuse this terminal, so attaching
+        // once here is the whole lifetime.
+        terminal.attachCustomKeyEventHandler(this.onKey);
         register(addEventListener(window, 'resize', () => fitAddon.fit()));
         register(addEventListener(window, 'beforeunload', this.onWindowUnload));
+    }
+
+    // The reason Shift+Enter looked broken in a pane is in xterm.js's own key evaluation
+    // (src/common/input/Keyboard.ts, case 13): Enter is evaluated as `ev.altKey ? ESC+CR : CR`, so
+    // Shift is not consulted and Shift+Enter reaches the pty as a plain CR - the app sees "submit".
+    // Pi binds Shift+Enter, and Ctrl+J, to inserting a newline, so a multi-line prompt was untypeable
+    // in a pane unless something in front of xterm translated it, which is what the front page did with
+    // a synthesised Ctrl+J keydown - for the panes it framed, and for nothing else.
+    //
+    // LF is the byte to send rather than a Kitty CSI-u Shift+Enter (`\x1b[13;2u`), and that is a
+    // measured choice, not a cautious one. Measured with hack/ttyd-ws-probe.mjs against a tmux pane whose
+    // application puts its own pty in raw mode (`stty raw -echo; cat > /tmp/k.bin`), so no line discipline
+    // is quietly rewriting the bytes on the way in:
+    //
+    //   tmux 3.6 parses a CSI-u Enter and rewrites it to a plain CR - `\x1b[13;2u` (Shift+Enter) and
+    //   `\x1b[13;5u` (Ctrl+Enter) both arrive as `\r`, which is Submit to an application, the exact
+    //   opposite of what the key means. A raw LF is forwarded unchanged.
+    //
+    // So an extended-key spelling cannot survive this deployment, LF can, and LF is also what Ctrl+J
+    // types - the other half of Pi's `tui.input.newLine` binding - which makes it the one spelling every
+    // application in these panes already handles. (An earlier version of this note claimed tmux turned a
+    // CSI-u into LF; that reading came from a cooked pane, where ICRNL rewrites CR to LF and echoes what
+    // was typed. Raw mode is the condition a TUI actually runs in, and the only one worth trusting.)
+    @bind
+    private onKey(event: KeyboardEvent): boolean {
+        // Opt-out for a terminal that can report the real key combination (`-t enableShiftEnter=false`).
+        if (!this.enableShiftEnter) return true;
+        // Mid-composition an Enter belongs to the IME, and xterm knows that; do not steal it.
+        if (event.isComposing) return true;
+        // Only keydown carries the mapping. A keyup is left to xterm, which emits nothing for Enter.
+        if (event.type !== 'keydown') return true;
+        if (event.code !== 'Enter' && event.code !== 'NumpadEnter') return true;
+        if (!event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return true;
+        // While the pane is down, ttyd's own rule is "press Enter to reconnect" (it listens on
+        // terminal.onKey for event.key === 'Enter', which Shift+Enter also is). Suppressing the key here
+        // would eat that, and sendData would drop the newline anyway.
+        if (this.socket?.readyState !== WebSocket.OPEN) return true;
+        // Holding the key down inserts one newline, matching what these panes did through the front page.
+        if (event.repeat) return false;
+        this.sendData('\n');
+        // Returning false is what suppresses xterm's own CR for the same keystroke.
+        return false;
     }
 
     @bind
@@ -486,6 +538,10 @@ export class Xterm {
                         terminal.loadAddon(register(new ImageAddon()));
                         console.log('[ttyd] Sixel enabled');
                     }
+                    break;
+                case 'enableShiftEnter':
+                    this.enableShiftEnter = value !== false;
+                    console.log(`[ttyd] Shift+Enter -> newline ${this.enableShiftEnter ? 'enabled' : 'disabled'}`);
                     break;
                 case 'titleFixed':
                     if (!value || value === '') return;
