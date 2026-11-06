@@ -264,14 +264,30 @@ export class Xterm {
         if (!this.enableShiftEnter) return true;
         // Mid-composition an Enter belongs to the IME, and xterm knows that; do not steal it.
         if (event.isComposing) return true;
-        // Only keydown carries the mapping. A keyup is left to xterm, which emits nothing for Enter.
-        if (event.type !== 'keydown') return true;
         if (event.code !== 'Enter' && event.code !== 'NumpadEnter') return true;
         if (!event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return true;
         // While the pane is down, ttyd's own rule is "press Enter to reconnect" (it listens on
         // terminal.onKey for event.key === 'Enter', which Shift+Enter also is). Suppressing the key here
         // would eat that, and sendData would drop the newline anyway.
         if (this.socket?.readyState !== WebSocket.OPEN) return true;
+        // keyup is left to xterm, which emits nothing for Enter but does the focus and cursor bookkeeping.
+        if (event.type === 'keyup') return true;
+        // keypress has to be refused as well as keydown, and nothing in the API suggests that. xterm.js
+        // writes terminal data from *both* events: `_keyDown` sets `_keyDownHandled` only on the way through
+        // `cancel()` (Terminal.ts: a custom handler returning false returns before either point), and
+        // `_keyPress` skips itself only when that flag is true. Left alone, the browser's keypress for the
+        // same Enter reaches `_keyPress`, which does `String.fromCharCode(charCode)` - 13, a CR - and writes
+        // it. Measured through Chrome's input pipeline (hack/front-cdp.mjs --key 'shift+Enter') against a
+        // pane whose application records its own stdin: this mapping produced `\n` and xterm followed it with
+        // `\r`, which to Pi is a Submit landing immediately after the newline the key was meant to insert -
+        // the key both worked and failed. It took a re-measurement to find, because a KeyboardEvent built and
+        // dispatched from JavaScript never produces a keypress; only Chrome's own input pipeline does, so
+        // every earlier probe of this handler was blind to the second half of the keystroke.
+        if (event.type === 'keypress') return false;
+        // The keydown default is a linefeed inserted into xterm's hidden helper textarea - the thing the
+        // textarea exists to have xterm read instead of act on - so cancel it rather than let a second
+        // listener on the page react to the same Enter.
+        event.preventDefault();
         // Holding the key down inserts one newline, matching what these panes did through the front page.
         if (event.repeat) return false;
         this.sendData('\n');
