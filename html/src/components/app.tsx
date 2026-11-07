@@ -19,6 +19,10 @@ const clientOptions = {
     // xterm.js evaluates Shift+Enter as plain Enter, so a pane needs the browser to translate it.
     // See the onKey handler in ./terminal/xterm for why the translation is a newline.
     enableShiftEnter: true,
+    // xterm.js turns Ctrl+V into 0x16 and cancels the keydown, which is the browser's paste default. Leaving
+    // the key to the browser is what makes a clipboard image reach the upload path; Ctrl+Shift+V keeps 0x16.
+    // See the onKey handler in ./terminal/xterm and hack/keys-case.sh.
+    enableCtrlVPaste: true,
     isWindows: false,
     unicodeVersion: '11',
 } as ClientOptions;

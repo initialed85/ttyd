@@ -60,6 +60,7 @@ export interface ClientOptions {
     enableTrzsz: boolean;
     enableSixel: boolean;
     enableShiftEnter: boolean;
+    enableCtrlVPaste: boolean;
     enableUpload: boolean;
     titleFixed?: string;
     isWindows: boolean;
@@ -152,6 +153,9 @@ export class Xterm {
     // True before the websocket reports preferences, so the first keystroke after a page load behaves
     // the same as every one after it.
     private enableShiftEnter = true;
+    // Ctrl+V is left to the browser as paste unless the operator turns this off (`-t enableCtrlVPaste=false`),
+    // which hands the key back to xterm. See onKey for the measurement that picked the default.
+    private enableCtrlVPaste = true;
     // Reported by the server once per connection. Uploads need a writable pane and a server that has
     // not been started with --disable-upload.
     private capabilities: Capabilities = { upload: false, uploadMaxBytes: 0, uploadDir: '' };
@@ -358,6 +362,45 @@ export class Xterm {
     // was typed. Raw mode is the condition a TUI actually runs in, and the only one worth trusting.)
     @bind
     private onKey(event: KeyboardEvent): boolean {
+        // Ctrl+V is the paste key on Linux and Windows, and xterm.js eats it. In
+        // src/common/input/Keyboard.ts the default branch turns any Ctrl+letter into
+        // String.fromCharCode(keyCode - 64), so Ctrl+V becomes 0x16, and Terminal._keyDown finishes a key that
+        // produced data with `cancel(event, true)` - preventDefault and stopPropagation - which is precisely
+        // the default action the browser would have used to paste. Measured with hack/keys-case.sh against a
+        // pane recording its own stdin raw (`stty raw -echo; cat > /tmp/keys.bin`), through Chrome's real
+        // input pipeline (hack/front-cdp.mjs --key ctrl+v):
+        //
+        //   ctrl+v          16                        one byte, and nothing else: the keystroke won
+        //   meta+v          (nothing)                 xterm produced no key, so `return true` happened
+        //                                               before cancel() and the browser kept the paste
+        //   ctrl+shift+v    (nothing)
+        //
+        // That is the whole of the Mac-works/Linux-doesn't asymmetry the keyboard can show: Cmd+V was already
+        // left to the browser, Ctrl+V was not. Returning false from this handler makes xterm do what it does
+        // for Cmd+V, because Terminal._keyDown returns at the custom-handler check - before cancel(), before
+        // preventDefault and before stopPropagation - and the paste default survives to reach ttyd's own paste
+        // listener, which is where a clipboard image becomes an upload.
+        //
+        // 0x16 is not lost, it moves: Ctrl+Shift+V sends it explicitly. Ctrl+V is `readline`'s
+        // literal-next and `bash`'s verbatim-input, and swallowing it silently would break a keystroke people
+        // use on purpose, so the byte keeps a spelling rather than being given up.
+        if (this.enableCtrlVPaste && event.code === 'KeyV' && event.ctrlKey && !event.altKey && !event.metaKey) {
+            // Mid-composition the key belongs to the IME, as with Enter.
+            if (event.isComposing) return true;
+            if (event.type === 'keyup') return true;
+            if (event.shiftKey) {
+                if (event.type !== 'keydown') return true;
+                event.preventDefault();
+                // Holding the key down repeats the byte, which is what a repeated literal-next wants.
+                if (!event.repeat) this.sendData('\x16');
+                return false;
+            }
+            // keydown and keypress both: xterm writes terminal data from either one, and the lesson from the
+            // Enter work below is that refusing only the keydown leaves the second half of the keystroke
+            // intact. Whether Ctrl+V also produces a keypress is measured, not assumed - see hack/keys-case.sh.
+            return false;
+        }
+
         // Opt-out for a terminal that can report the real key combination (`-t enableShiftEnter=false`).
         if (!this.enableShiftEnter) return true;
         // Mid-composition an Enter belongs to the IME, and xterm knows that; do not steal it.
@@ -779,6 +822,12 @@ export class Xterm {
                 case 'enableShiftEnter':
                     this.enableShiftEnter = value !== false;
                     console.log(`[ttyd] Shift+Enter -> newline ${this.enableShiftEnter ? 'enabled' : 'disabled'}`);
+                    break;
+                case 'enableCtrlVPaste':
+                    this.enableCtrlVPaste = value !== false;
+                    if (!this.enableCtrlVPaste) {
+                        console.log('[ttyd] Ctrl+V sent to the pane as 0x16 (Ctrl+Shift+V is always 0x16)');
+                    }
                     break;
                 case 'enableUpload':
                     this.enableUpload = value !== false;
