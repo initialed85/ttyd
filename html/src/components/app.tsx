@@ -23,6 +23,9 @@ const clientOptions = {
     // the key to the browser is what makes a clipboard image reach the upload path; Ctrl+Shift+V keeps 0x16.
     // See the onKey handler in ./terminal/xterm and hack/keys-case.sh.
     enableCtrlVPaste: true,
+    // Plain right click stays the pane's (tmux has its own built-in pane menu); Ctrl or Meta plus right click
+    // still opens the browser menu. See the contextmenu listener in ./terminal/xterm.
+    enableContextMenuGate: true,
     isWindows: false,
     unicodeVersion: '11',
 } as ClientOptions;

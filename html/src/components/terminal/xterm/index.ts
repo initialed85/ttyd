@@ -61,6 +61,7 @@ export interface ClientOptions {
     enableSixel: boolean;
     enableShiftEnter: boolean;
     enableCtrlVPaste: boolean;
+    enableContextMenuGate: boolean;
     enableUpload: boolean;
     titleFixed?: string;
     isWindows: boolean;
@@ -156,6 +157,11 @@ export class Xterm {
     // Ctrl+V is left to the browser as paste unless the operator turns this off (`-t enableCtrlVPaste=false`),
     // which hands the key back to xterm. See onKey for the measurement that picked the default.
     private enableCtrlVPaste = true;
+    // A plain right click belongs to the pane: tmux has its own built-in pane menu and the browser drawing a
+    // menu over the terminal on top of it is noise. Ctrl or Meta plus right click still opens the browser
+    // menu, which is what a copy/inspect/save gesture wants. `-t enableContextMenuGate=false` restores the
+    // browser's default of answering every right click. See the contextmenu listener for what each menu is.
+    private enableContextMenuGate = true;
     // Reported by the server once per connection. Uploads need a writable pane and a server that has
     // not been started with --disable-upload.
     private capabilities: Capabilities = { upload: false, uploadMaxBytes: 0, uploadDir: '' };
@@ -208,6 +214,16 @@ export class Xterm {
         } catch (e) {
             console.error(`[ttyd] fetch ${this.options.tokenUrl}: `, e);
         }
+    }
+
+    @bind
+    private onContextMenu(event: MouseEvent) {
+        // Ctrl or Meta passes straight through to the browser. Everything else is cancelled, which stops
+        // Chrome answering for the helper textarea xterm.js keeps inside the terminal. tmux's own pane menu
+        // is not affected either way: it comes from MouseDown3Pane in tmux's key tables, which reaches tmux
+        // through xterm.js's mouse reporting rather than through this event.
+        if (!this.enableContextMenuGate || event.ctrlKey || event.metaKey) return;
+        event.preventDefault();
     }
 
     @bind
@@ -326,6 +342,19 @@ export class Xterm {
         register(addEventListener(fileTarget, 'paste', this.onPaste as EventListener, true));
         register(addEventListener(fileTarget, 'dragover', this.onDragOver as EventListener, true));
         register(addEventListener(fileTarget, 'drop', this.onDrop as EventListener, true));
+        // Right click is answered by two independent stacks. tmux's pane menu comes from its own built-in
+        // `bind-key -T root MouseDown3Pane display-menu ...` (Horizontal Split, Vertical Split, Swap Up/Down,
+        // Swap Marked, Kill, Respawn, Mark, Zoom), which reaches tmux through xterm.js's mouse reporting -
+        // nothing in this file can suppress it, and it is not what this is about. The browser's menu is the
+        // other stack: it answers the contextmenu event, xterm.js routes button 2 through mousedown when
+        // `rightClickSelectsWord` is on (it is on by default) and keeps its own contextmenu listener with an
+        // isLinux branch, and Chrome answers for the helper textarea xterm.js keeps inside the terminal. With
+        // both answering, a plain right click put tmux's menu and Chrome's menu on screen at the same time.
+        //
+        // Gated on an ancestor in the capture phase for the same reason the upload listeners are: it runs
+        // before xterm.js's handlers. Ctrl or Meta passes through untouched, which is the convention xterm.js
+        // already uses on Linux and the one wanted here.
+        register(addEventListener(fileTarget, 'contextmenu', this.onContextMenu as EventListener, true));
         // terminal.parser is public API (xterm.js typings: ITerminal.parser -> IParser), so OSC 52
         // lives here rather than in a forked xterm.
         register(terminal.parser.registerOscHandler(52, this.onOsc52));
@@ -828,6 +857,10 @@ export class Xterm {
                     if (!this.enableCtrlVPaste) {
                         console.log('[ttyd] Ctrl+V sent to the pane as 0x16 (Ctrl+Shift+V is always 0x16)');
                     }
+                    break;
+                case 'enableContextMenuGate':
+                    this.enableContextMenuGate = value !== false;
+                    console.log(`[ttyd] right click menu gate ${this.enableContextMenuGate ? 'on' : 'off'}`);
                     break;
                 case 'enableUpload':
                     this.enableUpload = value !== false;
