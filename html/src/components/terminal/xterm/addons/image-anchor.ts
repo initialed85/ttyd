@@ -9,15 +9,23 @@
 //
 // tools/tmux-osc-wrap.py --anchor does the saving half: it writes each picture it passes into the pane's own
 // working directory under .slopyphus/images, named by a prefix of its content hash, and prints one dimmed line of
-// text on the row below the rows it reserved for the picture:
+// text at the top-left cell of the space it reserves for the picture - its own row, column 0:
 //
 //     [[img:<10 hex>.<ext>:<rows>]]
 //
 // Text is the one thing that survives every repaint listed above. This addon is the other half: it reads those
-// lines out of the buffer and draws the file they name, in the rows above the line, on every render. The bytes
-// come from ttyd itself - `GET <base>/images/<name>` in src/http.c, which accepts nothing but a name of that exact
-// shape and answers `Cache-Control: public, max-age=31536000, immutable`, because a content hash prefix never
-// names different content and a picture redrawn from a cache is only the same picture if it is the same bytes.
+// lines out of the buffer and draws the file they name, downward from the row the line is printed on, on every
+// render. The bytes come from ttyd itself - `GET <base>/images/<name>` in src/http.c, which accepts nothing but a
+// name of that exact shape and answers `Cache-Control: public, max-age=31536000, immutable`, because a content hash
+// prefix never names different content and a picture redrawn from a cache is only the same picture if it is the
+// same bytes.
+//
+// The token sits above the picture rather than below it, and the reason is tmux's reflow. A narrowing pane rewraps
+// long lines, and rewrapping inserts rows into the lines that wrap. With the reserved emptiness *below* the record,
+// a long line above the picture could wrap into the rows the picture was promised, and the guard below would
+// correctly refuse to draw over text - which is what a report described as a picture that reappears on a resize
+// "under some situations". With the emptiness *after* the record, wrapping happens above the pair and the token and
+// the rows it owns move down together, unchanged.
 //
 // The row count is part of the anchor rather than something worked out here, for two reasons. Reserved blank rows
 // are indistinguishable from blank rows the application printed, so the reservation is only knowable from the
@@ -43,7 +51,9 @@ const CACHE_LIMIT = 48;
 interface Placement {
     name: string;
     rows: number;
-    // The buffer row the anchor line itself sits on, absolute (buffer coordinates, not viewport coordinates).
+    // The buffer row the anchor line itself sits on, absolute (buffer coordinates, not viewport coordinates), and
+    // therefore the picture's own top row: the relay prints the token at the cursor cell and the picture renders
+    // downward from that cell, so the token's cell is the picture's top-left.
     row: number;
 }
 
@@ -129,6 +139,15 @@ export class ImageAnchorAddon implements ITerminalAddon {
         if (!ctx) return;
 
         const buffer = terminal.buffer.active;
+        // tmux draws its own chrome in the columns a client has that the window does not, and this deployment asks
+        // for that on purpose: window-size is `largest` (.tmux.conf) so a narrow browser cannot shrink an agent's
+        // pane, which guarantees a client wider than what it is attached to. Measured the same afternoon in the
+        // anchor-narrow case - a 50-column client on a 40-column window - every row of the pane read `│` at column
+        // 40 followed by nine `·`, including the twenty rows an anchor had reserved. Judged as content, that is
+        // twenty rows of somebody's writing lying over a picture, and the guard below correctly refused to draw
+        // one, which is the report "resizing the window brings it back under some situations" seen from the side
+        // where it is a refusal rather than a disappearance.
+        const padCol = this.paddingColumn(buffer, rows, cols);
         // The scan runs on every render and nothing is cached about its result. Three separate bugs in this
         // feature have had the same shape: an answer computed for an earlier render, still internally consistent,
         // and no longer true. The viewport key below was the second of them - scrolling, a resize, the buffer
@@ -162,30 +181,43 @@ export class ImageAnchorAddon implements ITerminalAddon {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, width, height);
 
-        // Bottom-up: the anchor row is the bottom edge of its own reservation, because the relay printed the
-        // picture's newlines before the anchor line. So a picture spans the rows immediately above its line.
+        // Top-down: the anchor is printed at the top-left cell of the space it reserves, so a picture covers its
+        // own row and the rows below it. The token's row is allowed to be non-empty - it is what the token is -
+        // provided it holds nothing *else*, because a reflow that wrapped somebody's sentence onto the token's row
+        // is a sentence a picture must not cover.
         const live: Placement[] = [];
         for (const placement of this.placements) {
             const line = buffer.getLine(placement.row);
-            if (!this.matches(placement, line ? line.translateToString(true) : '')) {
+            const text = line ? line.translateToString(true) : '';
+            if (!this.matches(placement, text)) {
                 // Said out loud rather than left to inference, because "nothing was drawn" and "the guard refused
                 // to draw" look identical from the outside and only differ in what the grid now contains.
-                const reads = (line ? line.translateToString(true) : '').trim().slice(0, 60);
-                this.log(`not drawing ${placement.name} at row ${placement.row}: it reads ${JSON.stringify(reads)}`);
+                this.log(
+                    `not drawing ${placement.name} at row ${placement.row}: it reads ${JSON.stringify(
+                        text.trim().slice(0, 60)
+                    )}`
+                );
                 continue;
             }
-            const top = Math.max(0, placement.row - placement.rows);
+            const token = `[[img:${placement.name}:${placement.rows}]]`;
+            const extra = this.content(text, 0, padCol).replace(token, '').trim();
+            if (extra) {
+                this.log(`not drawing ${placement.name}: its own row also reads ${JSON.stringify(extra.slice(0, 60))}`);
+                continue;
+            }
+            const top = placement.row;
+            const bottom = placement.row + placement.rows - 1;
             // A picture is drawn only where the grid is genuinely empty over the rows it would cover. Reserved
             // rows are empty by construction; a narrower pane reflows long lines into them, and then text wins,
             // because a covered sentence is a lost sentence while a covered picture is only a lost picture.
-            if (!this.clearAbove(buffer, top, placement.row - 1)) {
-                const hit = this.firstOccupied(buffer, top, placement.row - 1);
+            if (bottom > top && !this.clearBelow(buffer, top + 1, bottom, padCol)) {
+                const hit = this.firstOccupied(buffer, top + 1, bottom, padCol);
                 const why = `row ${hit.row} of the reserved rows is not empty: ${JSON.stringify(hit.text)}`;
                 this.log(`not drawing ${placement.name}: ${why}`);
                 continue;
             }
             live.push(placement);
-            this.paint(ctx, placement, buffer.viewportY, cellH, width, height);
+            this.paint(ctx, placement, buffer.viewportY, cellH, padCol < cols ? padCol * cellW : width, height);
         }
         if (live.length !== this.placements.length) {
             this.log(`drawing ${live.length} picture(s), was ${this.placements.length}`);
@@ -200,13 +232,50 @@ export class ImageAnchorAddon implements ITerminalAddon {
     }
 
     /** The first row in a range that is not empty, for the log above. */
-    private firstOccupied(buffer: ActiveBuffer, from: number, to: number): { row: number; text: string } {
+    private firstOccupied(
+        buffer: ActiveBuffer,
+        from: number,
+        to: number,
+        padCol: number
+    ): { row: number; text: string } {
         for (let row = from; row <= to; row++) {
             const line = buffer.getLine(row);
             const text = line ? line.translateToString(true) : '';
-            if (text.trim()) return { row, text: text.trim().slice(0, 60) };
+            const content = text.slice(0, padCol).trim();
+            if (content) return { row, text: content.slice(0, 60) };
         }
         return { row: -1, text: '' };
+    }
+
+    /**
+     * The column tmux starts drawing chrome at, or `cols` when a pane's client is not wider than its window.
+     *
+     * tmux fills the columns a client has that the window does not with a vertical border at the window's edge and
+     * the padding character after it, on every row. It is regular across the pane, which is what makes it
+     * identifiable without knowing the window's width: a `│` (or `┃`) followed by nothing but padding to the end of
+     * the line, at the same column on most rows. Requiring most of the viewport to agree is what keeps this from
+     * mistaking a line that happens to end in a box-drawing character for chrome, and taking the smallest such
+     * column keeps a genuine `│·` inside real content from being mistaken for the edge.
+     */
+    private paddingColumn(buffer: ActiveBuffer, rows: number, cols: number): number {
+        let edge = -1;
+        let hits = 0;
+        for (let y = buffer.viewportY; y < buffer.viewportY + rows; y++) {
+            const line = buffer.getLine(y);
+            const text = line ? line.translateToString(true) : '';
+            const m = text.match(/[│┃][·\s]*$/);
+            if (!m || m.index === undefined) continue;
+            if (m.index === 0) continue; // a border at column 0 is the left edge of a pane, not padding
+            if (edge === -1 || m.index < edge) edge = m.index;
+            hits++;
+        }
+        if (edge <= 0 || hits < Math.max(2, Math.floor(rows / 2))) return cols;
+        return edge;
+    }
+
+    /** A row's text, cut at the column tmux's chrome starts at. */
+    private content(text: string, from: number, padCol: number): string {
+        return text.slice(from, padCol);
     }
 
     /** Re-read the anchor line the placement was found on, so a placement never outlives the line it came from. */
@@ -232,11 +301,11 @@ export class ImageAnchorAddon implements ITerminalAddon {
         return found;
     }
 
-    private clearAbove(buffer: ActiveBuffer, from: number, to: number): boolean {
+    private clearBelow(buffer: ActiveBuffer, from: number, to: number, padCol: number): boolean {
         for (let y = from; y <= to; y++) {
             const line = buffer.getLine(y);
-            if (!line) continue; // off the top of the buffer is still nothing drawn over
-            if (line.translateToString(true).trim() !== '') return false;
+            if (!line) continue; // past the end of the buffer is still nothing drawn over
+            if (line.translateToString(true).slice(0, padCol).trim() !== '') return false;
         }
         return true;
     }
@@ -246,7 +315,7 @@ export class ImageAnchorAddon implements ITerminalAddon {
         placement: Placement,
         viewportY: number,
         cellH: number,
-        width: number,
+        availW: number,
         height: number
     ): void {
         const img = this.images.get(placement.name);
@@ -265,18 +334,21 @@ export class ImageAnchorAddon implements ITerminalAddon {
         // move every drawing up by those three cells or the picture lands on the wrong rows, which is the kind of
         // error that only shows up once somebody scrolls - which is the whole reason this feature exists.
         const anchorRow = placement.row - viewportY;
-        const bottom = anchorRow * cellH; // the top of the anchor row is where the reservation ends
-        if (bottom <= 0) return; // the whole reservation is scrolled above the viewport
-
+        // The token's cell is the picture's top-left cell, so the picture starts at the top of the anchor's row.
+        const top = anchorRow * cellH;
         let h = placement.rows * cellH;
+        // Part of the picture scrolled above the viewport is drawn with a negative top and the canvas clips it,
+        // rather than clamped to row zero: clamping is what moves a picture onto rows its anchor does not own.
+        if (top >= height || top + h <= 0) return;
         let w = h * natural;
-        if (w > width) {
-            w = width;
+        if (w > availW) {
+            // The one place an anchor's row count is not the whole story about size: a picture kept at its aspect
+            // ratio in a pane narrower than its width is shorter than the rows it was given, and the harness
+            // measures that gap rather than pretending it is zero. availW is the pane's own width, which stops at
+            // tmux's chrome rather than at the browser's - a picture is not allowed to draw over a pane border.
+            w = availW;
             h = w / natural;
         }
-        let top = bottom - h;
-        if (top < 0) top = 0; // scrolled so that part of the picture is above the viewport: draw what is left
-        if (top >= height) return; // and the other way round, scrolled past the bottom
         // Left aligned at column 0, which is where every picture measured in hack/image-cases.sh was emitted.
         ctx.drawImage(img, 0, top, w, h);
     }
