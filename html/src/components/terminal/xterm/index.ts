@@ -8,6 +8,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { ImageAddon } from '@xterm/addon-image';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { OverlayAddon } from './addons/overlay';
+import { ImageAnchorAddon } from './addons/image-anchor';
 import { ZmodemAddon } from './addons/zmodem';
 
 import '@xterm/xterm/css/xterm.css';
@@ -139,6 +140,7 @@ export class Xterm {
     private terminal: Terminal;
     private fitAddon = new FitAddon();
     private overlayAddon = new OverlayAddon();
+    private imageAnchorAddon = new ImageAnchorAddon();
     private webglAddon?: WebglAddon;
     private canvasAddon?: CanvasAddon;
     private zmodemAddon?: ZmodemAddon;
@@ -283,7 +285,7 @@ export class Xterm {
     @bind
     public open(parent: HTMLElement) {
         this.terminal = new Terminal(this.options.termOptions);
-        const { terminal, fitAddon, overlayAddon } = this;
+        const { terminal, fitAddon, overlayAddon, imageAnchorAddon } = this;
         window.term = terminal as TtydTerminal;
         window.term.fit = () => {
             this.fitAddon.fit();
@@ -291,6 +293,10 @@ export class Xterm {
 
         terminal.loadAddon(fitAddon);
         terminal.loadAddon(overlayAddon);
+        // No option gates this one: it draws nothing until a pane contains an anchor line, and an anchor line only
+        // exists when the pane's relay was started with --anchor. A terminal with no anchors in it costs one
+        // substring search per row per render.
+        terminal.loadAddon(imageAnchorAddon);
         terminal.loadAddon(new WebLinksAddon());
 
         terminal.open(parent);
