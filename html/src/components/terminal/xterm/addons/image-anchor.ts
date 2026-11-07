@@ -51,7 +51,7 @@ export class ImageAnchorAddon implements ITerminalAddon {
     private terminal: Terminal;
     private canvas?: HTMLCanvasElement;
     private placements: Placement[] = [];
-    private scanKey = '';
+    private geometryNudged = false;
     private images = new Map<string, HTMLImageElement>();
     // One console warning per name, not per frame: a picture that is not there stays not there for the whole
     // scrollback and a warning per render is how a pane becomes unreadable in the developer tools.
@@ -75,7 +75,6 @@ export class ImageAnchorAddon implements ITerminalAddon {
         }
         this.canvas = undefined;
         this.placements = [];
-        this.scanKey = '';
         this.images.clear();
         this.complained.clear();
         this.loading.clear();
@@ -108,7 +107,20 @@ export class ImageAnchorAddon implements ITerminalAddon {
         const rows = terminal.rows;
         const cellW = rect.width / cols;
         const cellH = rect.height / rows;
-        if (!(cellW > 0) || !(cellH > 0) || !isFinite(cellW) || !isFinite(cellH)) return;
+        if (!(cellW > 0) || !(cellH > 0) || !isFinite(cellW) || !isFinite(cellH)) {
+            // A render that happens before the page has laid the terminal out measures zero for everything. Ask
+            // once for another render instead of returning into a pane that may go idle and never render again: a
+            // client attaching to a pane whose picture was already printed is measured, 3 of 15 asserted looks
+            // across three harness runs on 07/11, drawing nothing and saying nothing at all. Once per unusable
+            // geometry, so a terminal that never gets a size cannot refresh-loop.
+            if (!this.geometryNudged) {
+                this.geometryNudged = true;
+                this.log(`the screen measured ${rect.width}x${rect.height}; asking xterm for another render`);
+                terminal.refresh(0, rows - 1);
+            }
+            return;
+        }
+        this.geometryNudged = false;
 
         const width = Math.round(rect.width);
         const height = Math.round(rect.height);
@@ -117,26 +129,26 @@ export class ImageAnchorAddon implements ITerminalAddon {
         if (!ctx) return;
 
         const buffer = terminal.buffer.active;
-        // Anything that can move an anchor relative to the grid: scrolling, a resize, the buffer growing, the
-        // canvas changing size, and the cursor moving. The last one is not optional, and the first harness run is
-        // what proved it: a browser attaching to a pane whose anchor line was already in the grid drew nothing,
-        // with the line sitting in the buffer exactly where the scan looked, with the picture fetching fine from
-        // the browser (200, image/png, 342 bytes), and with no exception anywhere. The key had not changed
-        // between the render of an empty viewport and the render of the same viewport filled with text - writing
-        // content into a viewport that is already the right size moves viewportY, baseY, the buffer length and
-        // the grid size none at all - so the cached empty answer was kept and nothing was ever looked for again.
-        // The cursor is what text arrival actually moves.
+        // The scan runs on every render and nothing is cached about its result. Three separate bugs in this
+        // feature have had the same shape: an answer computed for an earlier render, still internally consistent,
+        // and no longer true. The viewport key below was the second of them - scrolling, a resize, the buffer
+        // growing, the canvas resizing and the cursor moving folded into one string - and adding the cursor to it
+        // fixed the case that had been measured (a client attaching to a pane whose anchor was already printed:
+        // writing text into a viewport that is already the right size moves viewportY, baseY, the buffer length and
+        // the grid size none at all) and left the rest, which is that a program rewriting a viewport and parking
+        // the cursor where it already was left the key untouched, so an anchor appearing in such a rewrite was
+        // never looked for. Three runs of this harness on 07/11 showed the gap is not theoretical: the same product
+        // code and the same cases passed 15 looks on one run and failed 2 on another, and the failing looks logged
+        // nothing at all, which is exactly what a cached empty scan looks like from outside.
         //
-        // The residual gap, for the record: a program that rewrites a viewport and parks the cursor exactly where
-        // it already was leaves this key untouched, and an anchor that appears in such a rewrite is not noticed.
-        // Every placement is still re-verified against its own line and the rows above it on each draw, below, so
-        // what cannot happen is a stale picture being drawn; what cannot happen *without something else moving* is
-        // a new anchor being found.
-        const key = `${buffer.viewportY}|${buffer.baseY}|${buffer.length}|${cols}|${rows}|${width}x${height}|${buffer.cursorY}:${buffer.cursorX}`;
-        if (key !== this.scanKey) {
-            this.scanKey = key;
-            this.placements = this.scan(buffer, rows);
+        // The cost is `rows` line translations per render, measured in the harness (scanCost, reported by the page)
+        // rather than assumed. What stays cached is the picture's bytes, keyed by content hash, so a hot pane pays
+        // for the scan and not for the fetch.
+        const found = this.scan(buffer, rows);
+        if (found.length !== this.placements.length) {
+            this.log(`scan found ${found.length} anchor(s), was ${this.placements.length}`);
         }
+        this.placements = found;
 
         const dpr = window.devicePixelRatio || 1;
         const pw = Math.round(width * dpr);
@@ -155,16 +167,46 @@ export class ImageAnchorAddon implements ITerminalAddon {
         const live: Placement[] = [];
         for (const placement of this.placements) {
             const line = buffer.getLine(placement.row);
-            if (!this.matches(placement, line ? line.translateToString(true) : '')) continue;
+            if (!this.matches(placement, line ? line.translateToString(true) : '')) {
+                // Said out loud rather than left to inference, because "nothing was drawn" and "the guard refused
+                // to draw" look identical from the outside and only differ in what the grid now contains.
+                const reads = (line ? line.translateToString(true) : '').trim().slice(0, 60);
+                this.log(`not drawing ${placement.name} at row ${placement.row}: it reads ${JSON.stringify(reads)}`);
+                continue;
+            }
             const top = Math.max(0, placement.row - placement.rows);
             // A picture is drawn only where the grid is genuinely empty over the rows it would cover. Reserved
             // rows are empty by construction; a narrower pane reflows long lines into them, and then text wins,
             // because a covered sentence is a lost sentence while a covered picture is only a lost picture.
-            if (!this.clearAbove(buffer, top, placement.row - 1)) continue;
+            if (!this.clearAbove(buffer, top, placement.row - 1)) {
+                const hit = this.firstOccupied(buffer, top, placement.row - 1);
+                const why = `row ${hit.row} of the reserved rows is not empty: ${JSON.stringify(hit.text)}`;
+                this.log(`not drawing ${placement.name}: ${why}`);
+                continue;
+            }
             live.push(placement);
             this.paint(ctx, placement, buffer.viewportY, cellH, width, height);
         }
+        if (live.length !== this.placements.length) {
+            this.log(`drawing ${live.length} picture(s), was ${this.placements.length}`);
+        }
         this.placements = live;
+    }
+
+    private log(message: string) {
+        // console.log rather than a debug switch: the harness captures the page console and this is the only
+        // record of why a picture was declined, which is the question a report can only describe as "it vanished".
+        console.log('anchor: ' + message);
+    }
+
+    /** The first row in a range that is not empty, for the log above. */
+    private firstOccupied(buffer: ActiveBuffer, from: number, to: number): { row: number; text: string } {
+        for (let row = from; row <= to; row++) {
+            const line = buffer.getLine(row);
+            const text = line ? line.translateToString(true) : '';
+            if (text.trim()) return { row, text: text.trim().slice(0, 60) };
+        }
+        return { row: -1, text: '' };
     }
 
     /** Re-read the anchor line the placement was found on, so a placement never outlives the line it came from. */
@@ -253,7 +295,6 @@ export class ImageAnchorAddon implements ITerminalAddon {
             }
             // The render that asked for this picture drew nothing. Ask for another one rather than waiting for
             // whatever the pane does next.
-            this.scanKey = '';
             this.terminal.refresh(0, this.terminal.rows - 1);
         };
         img.onerror = () => {
