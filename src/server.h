@@ -34,6 +34,15 @@
 #define TTYD_UPLOAD_MAX_BYTES_DEFAULT (8L * 1024 * 1024)
 #define TTYD_UPLOAD_MAX_BYTES_LIMIT (64 * 1024 * 1024)
 
+// The pictures the pane's own relay saved (tools/tmux-osc-wrap.py --anchor) live in
+// <working directory>/<TTYD_IMAGE_DIR_DEFAULT> and are served back at <base-path><TTYD_IMAGE_ROUTE><name>.
+// tmux keeps no copy of an inline image, so a repaint erases one; serving the bytes again is what lets a
+// browser redraw it. The name shape is part of the contract: a content hash prefix and one of the extensions the
+// relay writes, which is what makes an immutable Cache-Control honest and what keeps the open() below from being
+// a general file read.
+#define TTYD_IMAGE_DIR_DEFAULT ".slopyphus/images"
+#define TTYD_IMAGE_ROUTE "images/"
+
 // url paths
 struct endpoints {
   char *ws;
@@ -105,6 +114,7 @@ struct server {
   bool upload_disabled;    // --disable-upload: refuse browser file uploads outright
   long upload_max_bytes;   // --upload-max-bytes, per single file
   char upload_dir[128];    // directory under the working directory uploads land in
+  char image_dir[128];     // --image-dir: directory under the working directory the relay's saved pictures are read from
   int max_clients;         // maximum clients to support
   bool once;               // whether accept only one client and exit on disconnection
   bool exit_no_conn;       // whether exit on all clients disconnection

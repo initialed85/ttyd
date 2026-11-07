@@ -101,6 +101,30 @@ static void access_log(struct lws *wsi, const char *path) {
   lwsl_notice("HTTP %s - %s\n", path, rip);
 }
 
+// The pictures this pane's relay saved, read back over HTTP. tmux stores cells and keeps no copy of an inline
+// image - capture-pane -p -e on a pane that has just drawn one reports zero occurrences of the sequence it printed
+// - so every repaint (copy-mode, a resize, a pane menu, a reattach) erases the picture and nothing below tmux can
+// put it back. The bytes are reachable here instead, which is what lets a browser redraw them from a text marker
+// in the grid. Reading is why this route is shaped the way it is: only a name the relay itself would have written
+// is ever opened, so `..`, an absolute path, and anything else in the working directory cannot be asked for.
+static bool image_name_ok(const char *name) {
+  size_t i;
+  for (i = 0; i < 10; i++) {
+    char c = name[i];
+    if (c < '0' || (c > '9' && c < 'a') || c > 'f') return false;  // ten lowercase hex digits, then a dot
+  }
+  if (name[i++] != '.') return false;
+  const char *ext = name + i;
+  return strcmp(ext, "png") == 0 || strcmp(ext, "gif") == 0 || strcmp(ext, "bmp") == 0 || strcmp(ext, "jpg") == 0;
+}
+
+static const char *image_type(const char *name) {
+  if (endswith(name, ".gif")) return "image/gif";
+  if (endswith(name, ".bmp")) return "image/bmp";
+  if (endswith(name, ".jpg")) return "image/jpeg";
+  return "image/png";  // .png is the only name left that image_name_ok accepted
+}
+
 int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
   struct pss_http *pss = (struct pss_http *)user;
   unsigned char buffer[4096 + LWS_PRE], *p, *end;
@@ -150,6 +174,75 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
             lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
           return 1;
         goto try_to_reuse;
+      }
+
+      char images_prefix[256];
+      snprintf(images_prefix, sizeof(images_prefix), "%s%s", endpoints.index, TTYD_IMAGE_ROUTE);
+      if (strncmp(pss->path, images_prefix, strlen(images_prefix)) == 0) {
+        const char *name = pss->path + strlen(images_prefix);
+        if (!image_name_ok(name)) {
+          lws_return_http_status(wsi, HTTP_STATUS_NOT_FOUND, NULL);
+          goto try_to_reuse;
+        }
+
+        char dir[256], path[512];
+        if (getcwd(dir, sizeof(dir)) == NULL || snprintf(path, sizeof(path), "%s/%s/%s", dir, server->image_dir, name) >= (int)sizeof(path)) {
+          lws_return_http_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+          goto try_to_reuse;
+        }
+
+        // lstat before open, fstat after it, and the two must name the same regular file. A picture has to be a
+        // file the relay wrote, not a pointer somebody planted in the directory: the pane's own user can read
+        // /etc/passwd from their shell anyway, but a route shaped like "read this picture" should not turn into
+        // "read whatever this link points at" because a link appeared, and checking identity after the open closes
+        // the gap between the two calls without reaching for an open flag that is not portable.
+        //
+        // The size ceiling is the upload one: a picture is a file this stack accepts from a browser as well, and a
+        // second limit would be a second thing to keep in sync for no benefit.
+        struct stat listed, st;
+        int fd = -1;
+        if (lstat(path, &listed) == 0 && S_ISREG(listed.st_mode) && listed.st_size > 0 &&
+            listed.st_size <= server->upload_max_bytes && (fd = open(path, O_RDONLY)) >= 0 &&
+            fstat(fd, &st) == 0 && st.st_dev == listed.st_dev && st.st_ino == listed.st_ino && st.st_size > 0 &&
+            st.st_size <= server->upload_max_bytes) {
+          // the same regular file on both calls, small enough to read in one go
+        } else {
+          if (fd >= 0) close(fd);
+          // Absent, unreadable, a link, and over the limit are answered identically: this route does not report which
+          // pictures a pane has.
+          lws_return_http_status(wsi, HTTP_STATUS_NOT_FOUND, NULL);
+          goto try_to_reuse;
+        }
+
+        char *body = xmalloc((size_t)st.st_size);
+        ssize_t got = read(fd, body, (size_t)st.st_size);
+        close(fd);
+        if (got != st.st_size) {
+          free(body);
+          lws_return_http_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+          goto try_to_reuse;
+        }
+
+        const char *ctype = image_type(name);
+        // Honest because the name is a hash of the bytes: a name that does not change never names different
+        // content, which is what makes a redraw after a repaint cheap.
+        static const char *cache = "public, max-age=31536000, immutable";
+        if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+            lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, (const unsigned char *)ctype,
+                                         (int)strlen(ctype), &p, end) ||
+            lws_add_http_header_by_name(wsi, (unsigned char *)"Cache-Control:", (const unsigned char *)cache,
+                                        (int)strlen(cache), &p, end) ||
+            lws_add_http_header_content_length(wsi, (unsigned long)st.st_size, &p, end) ||
+            lws_finalize_http_header(wsi, &p, end) ||
+            lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+          free(body);
+          return 1;
+        }
+
+        pss->buffer = pss->ptr = body;
+        pss->len = (size_t)st.st_size;
+        lws_callback_on_writable(wsi);
+        break;
       }
 
       if (strcmp(pss->path, endpoints.index) != 0) {

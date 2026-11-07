@@ -81,6 +81,7 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"browser", no_argument, NULL, 'B'},
                                         {"disable-upload", no_argument, NULL, 1001},
                                         {"upload-max-bytes", required_argument, NULL, 1002},
+                                        {"image-dir", required_argument, NULL, 1003},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
@@ -117,6 +118,7 @@ static void print_help() {
           "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
           "        --disable-upload    Refuse browser file uploads (paste and drag-and-drop) into the working directory\n"
           "        --upload-max-bytes  Size limit per uploaded file in bytes (default: 8388608, max: 67108864)\n"
+          "        --image-dir         Directory under the working directory the pane's relay saves pictures in, served back at <base-path>images/<name> (default: .slopyphus/images)\n"
 #if LWS_LIBRARY_VERSION_NUMBER >= 4000000
           "    -P, --ping-interval     Websocket ping interval(sec) (default: 5)\n"
 #endif
@@ -163,6 +165,9 @@ static void print_config() {
     lwsl_notice("  browser uploads: disabled\n");
   else
     lwsl_notice("  browser uploads: %s (max %ld bytes per file)\n", server->upload_dir, server->upload_max_bytes);
+  // Worth printing even when nothing is saved yet: the relay's OSC_WRAP_IMAGES_DIR has to name the same place or
+  // the browser will ask for pictures this server will not find.
+  lwsl_notice("  served images: %s (GET %s%s<name>)\n", server->image_dir, endpoints.index, TTYD_IMAGE_ROUTE);
   if (!server->writable) lwsl_notice("The --writable option is not set, will start in readonly mode");
 }
 
@@ -180,6 +185,7 @@ static struct server *server_new(int argc, char **argv, int start) {
   // Defaults are set before the early return so a server with no command still has sane limits.
   ts->upload_max_bytes = TTYD_UPLOAD_MAX_BYTES_DEFAULT;
   sprintf(ts->upload_dir, "%s", TTYD_UPLOAD_DIR_DEFAULT);
+  sprintf(ts->image_dir, "%s", TTYD_IMAGE_DIR_DEFAULT);
   if (start == argc) return ts;
 
   int cmd_argc = argc - start;
@@ -397,6 +403,17 @@ int main(int argc, char **argv) {
           return -1;
         }
         server->upload_max_bytes = limit;
+        break;
+      }
+      case 1003: {
+        // The image directory is joined to the working directory, so it stays relative: an absolute path here
+        // would turn a route meant for one pane's pictures into a read of anywhere on the host.
+        if (optarg[0] == '/' || strlen(optarg) >= sizeof(server->image_dir)) {
+          fprintf(stderr, "ttyd: --image-dir must be a relative path shorter than %d characters\n",
+                  (int)sizeof(server->image_dir));
+          return -1;
+        }
+        sprintf(server->image_dir, "%s", optarg);
         break;
       }
       case 'p':
