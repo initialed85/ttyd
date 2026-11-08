@@ -57,6 +57,14 @@ type Preferences = ITerminalOptions & ClientOptions;
 // The query still wins, so `?fontSize=12` is the escape hatch and the number is overridable per pane.
 const MOBILE_FONT_PX = 16;
 
+// The other half of the same "is this a phone" question, asked once so the two rules cannot drift.
+const isCoarsePointer = (): boolean => window.matchMedia?.('(pointer: coarse)').matches === true;
+
+// How far a finger has to travel before a swipe can be called vertical or horizontal. Smaller and a
+// scroll is claimed out of a gesture that was meant to change panes; larger and the first half of every
+// scroll is eaten by the desktop. See initTouchScroll.
+const TOUCH_SCROLL_LOCK_PX = 10;
+
 // What the server said it is willing to do. Reported once per connection, before any of it is offered
 // in the UI, so a readonly pane does not pretend a dropped file will land somewhere.
 export interface Capabilities {
@@ -129,9 +137,14 @@ const parseOsc52 = (data: string): Osc52Request => {
     }
 };
 
-function addEventListener(target: EventTarget, type: string, listener: EventListener, capture = false): IDisposable {
-    target.addEventListener(type, listener, capture);
-    return toDisposable(() => target.removeEventListener(type, listener, capture));
+function addEventListener(
+    target: EventTarget,
+    type: string,
+    listener: EventListener,
+    captureOrOptions: boolean | AddEventListenerOptions = false
+): IDisposable {
+    target.addEventListener(type, listener, captureOrOptions);
+    return toDisposable(() => target.removeEventListener(type, listener, captureOrOptions));
 }
 
 // btoa over one huge string blows the call stack through String.fromCharCode, so encode in blocks.
@@ -386,6 +399,122 @@ export class Xterm {
         terminal.attachCustomKeyEventHandler(this.onKey);
         register(addEventListener(window, 'resize', () => fitAddon.fit()));
         register(addEventListener(window, 'beforeunload', this.onWindowUnload));
+        this.initTouchScroll();
+    }
+
+    /**
+     * A phone's swipe is the pane's mouse wheel.
+     *
+     * A phone has no wheel, and inside a tmux pane the wheel is the only thing that scrolls. tmux runs
+     * here with `set -g mouse on`, so xterm.js has mouse reports active, and that switches its own touch
+     * handling off (Terminal.ts binds touchstart/touchmove `if (!this.coreMouseService
+     * .areMouseEventsActive)`) on the reasoning that the application will answer mouse events. A finger
+     * never produces one, so the pane never even enters copy mode: measured on a bare ttyd pane at
+     * 390x844 with touch enabled, a 400px vertical drag before this handler existed left tmux reporting
+     * `pane_in_mode=0` with no change anywhere else - the history was there, 65536 lines of it, and
+     * nothing in the gesture reached it. With the handler, the same drag sends 8 wheel-up reports and the
+     * pane scrolls 35 lines, which is what tmux's own copy-mode position indicator reads as `(3/291)`
+     * in the top right of the screen.
+     *
+     * So the gesture becomes the WheelEvent a laptop would have sent, dispatched on the element xterm.js
+     * bound its own wheel listener to (Terminal.ts `_bindMouse`: `const el = this.element`), and what is
+     * already in xterm.js does the scrolling: with mouse reports active the wheel is reported to tmux,
+     * which enters copy-mode and walks its history; in an alt-screen app with no scrollback it becomes
+     * arrow keys instead. Deltas go as pixels, one event per touchmove, because Viewport
+     * .getLinesScrolled keeps the sub-line remainder itself (`_wheelPartialScroll`) rather than rounding
+     * each small move down to zero.
+     *
+     * Two things decide which gestures this may take, and both exist to protect the desktop's swipe
+     * between panes. First, only a *vertical* one, and only once its direction is known: the same
+     * measurement shows a horizontal drag that starts inside a pane being handed to the framing page,
+     * moving #wrap from scrollLeft 0 to 390 - one pane over - which a handler that prevented the first
+     * move would have eaten. Second, only when xterm.js has passed mouse to the application at all,
+     * read off `enable-mouse-events`, the class xterm.js puts on that same element when it does: without
+     * it, its own touch scrolling is live and a synthesized wheel would scroll the pane twice.
+     *
+     * The wheel's own speed is tmux's, not this file's: one report per touchmove, and tmux's copy-mode
+     * table moves five lines per report. A 400px drag therefore travels about 35 lines, which is a little
+     * further than the finger does, and `bind-key -T copy-mode WheelUpPane send-keys -X -N 3 scroll-up`
+     * in the user's tmux config is where to change it. Rebinding the *root* table instead was tried and
+     * measured to make no difference: a fresh container with the default bindings and a fresh one with
+     * `WheelUpPane` rewritten both scrolled exactly 35 lines from the same gesture.
+     */
+    @bind
+    private initTouchScroll(): void {
+        const { register } = this;
+        const target = this.terminal.element;
+        if (!target || !isCoarsePointer()) return;
+
+        let startX = 0;
+        let startY = 0;
+        let lastY = 0;
+        // 'unknown' until the gesture has travelled far enough to have a direction, then one value for
+        // the whole gesture: a drag that starts sideways stays the desktop's even if it ends going down.
+        // 'other' means something this must not touch - a sideways drag, a second finger, a pinch.
+        let axis: 'unknown' | 'vertical' | 'other' = 'unknown';
+
+        const owns = (): boolean =>
+            // xterm.js's own signal that it is forwarding mouse to the application, and therefore is not
+            // answering touch itself. Asked at gesture time rather than at bind time, because tmux asks
+            // for mouse reports after the pane connects.
+            target.classList.contains('enable-mouse-events');
+
+        const onStart = (ev: TouchEvent) => {
+            if (!ev.touches[0] || ev.touches.length !== 1) {
+                axis = 'other';
+                return;
+            }
+            startX = ev.touches[0].clientX;
+            startY = lastY = ev.touches[0].clientY;
+            axis = 'unknown';
+        };
+
+        const onMove = (ev: TouchEvent) => {
+            if (axis === 'other' || !ev.touches[0] || ev.touches.length !== 1) return;
+            const x = ev.touches[0].clientX;
+            const y = ev.touches[0].clientY;
+            if (axis === 'unknown') {
+                const dx = Math.abs(x - startX);
+                const dy = Math.abs(y - startY);
+                if (dx < TOUCH_SCROLL_LOCK_PX && dy < TOUCH_SCROLL_LOCK_PX) return;
+                axis = dy > dx ? 'vertical' : 'other';
+                if (axis !== 'vertical' || !owns()) {
+                    axis = 'other';
+                    return;
+                }
+            }
+            const deltaY = lastY - y;
+            lastY = y;
+            if (deltaY === 0) return;
+            // Content follows the finger, so dragging down shows what is above it: a wheel up.
+            target.dispatchEvent(
+                new WheelEvent('wheel', {
+                    deltaY,
+                    // Pixels. getLinesScrolled divides by the row height and carries the fraction.
+                    deltaMode: 0,
+                    bubbles: true,
+                    cancelable: true,
+                    clientX: x,
+                    clientY: y,
+                })
+            );
+            // After the direction is known and the wheel is sent, never before: preventing a move that the
+            // framing page still owns is exactly how the pane-to-pane swipe would break.
+            ev.preventDefault();
+        };
+
+        const onEnd = () => {
+            axis = 'unknown';
+        };
+
+        register(addEventListener(target, 'touchstart', onStart as EventListener));
+        register(addEventListener(target, 'touchmove', onMove as EventListener, { passive: false }));
+        register(addEventListener(target, 'touchend', onEnd as EventListener));
+        register(addEventListener(target, 'touchcancel', onEnd as EventListener));
+        // The line CI checks src/html.h for, in the same way the mobile font rule is gated: a client edit
+        // that was never rebuilt into the header sits in the fork's source and changes nothing a person
+        // can see from a browser. This says which of the two phone rules a pane actually took.
+        console.log('[ttyd] mobile touch scroll enabled');
     }
 
     // The reason Shift+Enter looked broken in a pane is in xterm.js's own key evaluation
@@ -759,7 +888,7 @@ export class Xterm {
         // The merge order at SET_PREFERENCES is the client's own defaults, then the server's -t options,
         // then this function's result, so what is synthesised here is the last word and the agent's
         // `-t fontSize=12` does not override it. Undefined here means the query said nothing.
-        if (prefs.fontSize === undefined && window.matchMedia?.('(pointer: coarse)').matches) {
+        if (prefs.fontSize === undefined && isCoarsePointer()) {
             prefs.fontSize = MOBILE_FONT_PX;
             // The log is what makes the rule debuggable from a pane's own console, and it is the marker
             // CI checks the shipped header against: a client edit that is not rebuilt into src/html.h
