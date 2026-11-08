@@ -43,6 +43,20 @@ enum Command {
 }
 type Preferences = ITerminalOptions & ClientOptions;
 
+// A phone's pane is a few hundred CSS pixels wide, and the font the server asks for is chosen for a
+// desktop terminal: the agent containers run `ttyd -t fontSize=12`, which at 390pt is a 54-column
+// terminal whose glyphs are 12 CSS px on a 3x display. That is legible, but it is not what reading an
+// agent's answer on your phone wants. 16px is ~40 columns, which is the width a terminal is still
+// useful at and the size that does not need zooming.
+//
+// The pointer, not the width, is the trigger: the desktop grid makes every pane a ~60px cell, and a
+// rule keyed on the pane's own width would hand those cells a 16px font and three columns. A laptop
+// with a touch screen is coarse and its panes are wide, and it gets the bigger font, which is the
+// answer anyone looking at a phone-sized layout on it would want anyway.
+//
+// The query still wins, so `?fontSize=12` is the escape hatch and the number is overridable per pane.
+const MOBILE_FONT_PX = 16;
+
 // What the server said it is willing to do. Reported once per connection, before any of it is offered
 // in the UI, so a readonly pane does not pretend a dropped file will land somewhere.
 export interface Capabilities {
@@ -740,6 +754,17 @@ export class Xterm {
                     prefs[k] = queryVal;
                     break;
             }
+        }
+
+        // The merge order at SET_PREFERENCES is the client's own defaults, then the server's -t options,
+        // then this function's result, so what is synthesised here is the last word and the agent's
+        // `-t fontSize=12` does not override it. Undefined here means the query said nothing.
+        if (prefs.fontSize === undefined && window.matchMedia?.('(pointer: coarse)').matches) {
+            prefs.fontSize = MOBILE_FONT_PX;
+            // The log is what makes the rule debuggable from a pane's own console, and it is the marker
+            // CI checks the shipped header against: a client edit that is not rebuilt into src/html.h
+            // lands in the fork's source and changes nothing a user can see.
+            console.log('[ttyd] mobile font size', MOBILE_FONT_PX);
         }
 
         return prefs;
