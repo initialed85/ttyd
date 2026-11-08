@@ -44,18 +44,21 @@ enum Command {
 type Preferences = ITerminalOptions & ClientOptions;
 
 // A phone's pane is a few hundred CSS pixels wide, and the font the server asks for is chosen for a
-// desktop terminal: the agent containers run `ttyd -t fontSize=12`, which at 390pt is a 54-column
-// terminal whose glyphs are 12 CSS px on a 3x display. That is legible, but it is not what reading an
-// agent's answer on your phone wants. 16px is ~40 columns, which is the width a terminal is still
-// useful at and the size that does not need zooming.
+// desktop terminal: the agent containers run `ttyd -t fontSize=12`. At 390pt that is a 54-column
+// terminal, and the glyph is the same 12 CSS px it is on the desktop, which on a 3x display is 36
+// device px against a laptop's 12 - three times the size on the desktop's, and the same size on the
+// glass. This was 16, which made it four times; the user asked for about a third of it back and agreed
+// 12 as close enough.
 //
 // The pointer, not the width, is the trigger: the desktop grid makes every pane a ~60px cell, and a
-// rule keyed on the pane's own width would hand those cells a 16px font and three columns. A laptop
-// with a touch screen is coarse and its panes are wide, and it gets the bigger font, which is the
-// answer anyone looking at a phone-sized layout on it would want anyway.
+// rule keyed on the pane's own width would hand those cells the phone's font and a handful of columns.
+// A laptop with a touch screen is coarse and its panes are wide, and it gets the same size, which is
+// the answer anyone looking at a phone-sized layout on it would want anyway.
 //
-// The query still wins, so `?fontSize=12` is the escape hatch and the number is overridable per pane.
-const MOBILE_FONT_PX = 16;
+// The number is pinned rather than left inherited, because the server's -t option is the desktop's:
+// raising an agent's fontSize moves every pane on the desktop and must not move the phone. The query
+// still wins, so `?fontSize=` is the escape hatch and the size is overridable per pane.
+const MOBILE_FONT_PX = 12;
 
 // The other half of the same "is this a phone" question, asked once so the two rules cannot drift.
 const isCoarsePointer = (): boolean => window.matchMedia?.('(pointer: coarse)').matches === true;
@@ -64,6 +67,17 @@ const isCoarsePointer = (): boolean => window.matchMedia?.('(pointer: coarse)').
 // scroll is claimed out of a gesture that was meant to change panes; larger and the first half of every
 // scroll is eaten by the desktop. See initTouchScroll.
 const TOUCH_SCROLL_LOCK_PX = 10;
+
+// How many rows of finger travel a single wheel report stands for. tmux's copy-mode table moves five
+// lines per WheelUpPane, and Terminal.ts's `case 'wheel'` emits exactly one report per WheelEvent no
+// matter what its delta says - getLinesScrolled only decides whether the event reports at all, and the
+// direction comes from the sign of deltaY - so the only thing that sets the distance is how many
+// reports a gesture produces. Sending one per touchmove made that depend on the pointer's event rate:
+// the harness's 400px drag is 8 touchmoves and scrolled 35 lines, while a real finger covers the same
+// 400px in sixty or so and would have thrown the whole history past the person holding the phone.
+// Five rows per report makes a swipe travel about as far as the finger does, which is the half the
+// user asked for, and it is the same amount tmux moves per report so the two multiply to nothing.
+const TOUCH_SCROLL_LINES_PER_WHEEL = 5;
 
 // What the server said it is willing to do. Reported once per connection, before any of it is offered
 // in the UI, so a readonly pane does not pretend a dropped file will land somewhere.
@@ -413,8 +427,8 @@ export class Xterm {
      * 390x844 with touch enabled, a 400px vertical drag before this handler existed left tmux reporting
      * `pane_in_mode=0` with no change anywhere else - the history was there, 65536 lines of it, and
      * nothing in the gesture reached it. With the handler, the same drag sends 8 wheel-up reports and the
-     * pane scrolls 35 lines, which is what tmux's own copy-mode position indicator reads as `(3/291)`
-     * in the top right of the screen.
+     * pane walks its history, which is what tmux's own copy-mode position indicator reads in the top
+     * right of the screen.
      *
      * So the gesture becomes the WheelEvent a laptop would have sent, dispatched on the element xterm.js
      * bound its own wheel listener to (Terminal.ts `_bindMouse`: `const el = this.element`), and what is
@@ -432,12 +446,15 @@ export class Xterm {
      * read off `enable-mouse-events`, the class xterm.js puts on that same element when it does: without
      * it, its own touch scrolling is live and a synthesized wheel would scroll the pane twice.
      *
-     * The wheel's own speed is tmux's, not this file's: one report per touchmove, and tmux's copy-mode
-     * table moves five lines per report. A 400px drag therefore travels about 35 lines, which is a little
-     * further than the finger does, and `bind-key -T copy-mode WheelUpPane send-keys -X -N 3 scroll-up`
-     * in the user's tmux config is where to change it. Rebinding the *root* table instead was tried and
-     * measured to make no difference: a fresh container with the default bindings and a fresh one with
-     * `WheelUpPane` rewritten both scrolled exactly 35 lines from the same gesture.
+     * The speed is how many reports a gesture produces, not what each one says: Terminal.ts's
+     * `case 'wheel'` sends one report per WheelEvent whatever its delta, and tmux's copy-mode table moves
+     * five lines per report. An unadjusted 400px drag therefore travelled 35 lines, about twice as far as
+     * the finger, and only because the harness's gesture is 8 touchmoves - a real finger's 400px is
+     * sixty-odd and would scroll several hundred lines. TOUCH_SCROLL_LINES_PER_WHEEL counts rows of
+     * travel instead of events, and slowing the laptop's wheel was never an option: that would mean
+     * `bind-key -T copy-mode WheelUpPane`, which is the desktop's binding too. Rebinding the *root* table
+     * was tried and measured to make no difference: a fresh container with the default bindings and a
+     * fresh one with `WheelUpPane` rewritten both scrolled exactly 35 lines from the same gesture.
      */
     @bind
     private initTouchScroll(): void {
@@ -448,6 +465,8 @@ export class Xterm {
         let startX = 0;
         let startY = 0;
         let lastY = 0;
+        // Finger travel not yet turned into a report, in CSS px.
+        let carry = 0;
         // 'unknown' until the gesture has travelled far enough to have a direction, then one value for
         // the whole gesture: a drag that starts sideways stays the desktop's even if it ends going down.
         // 'other' means something this must not touch - a sideways drag, a second finger, a pinch.
@@ -459,6 +478,14 @@ export class Xterm {
             // for mouse reports after the pane connects.
             target.classList.contains('enable-mouse-events');
 
+        const rowHeight = (): number => {
+            // The element's own box over the grid's row count is the only public way to a row height here
+            // - the render service's dimensions are private - and a few px of padding over five rows is a
+            // rounding error.
+            const rows = this.terminal.rows || 1;
+            return target.clientHeight > 0 && rows > 0 ? target.clientHeight / rows : 20;
+        };
+
         const onStart = (ev: TouchEvent) => {
             if (!ev.touches[0] || ev.touches.length !== 1) {
                 axis = 'other';
@@ -466,6 +493,7 @@ export class Xterm {
             }
             startX = ev.touches[0].clientX;
             startY = lastY = ev.touches[0].clientY;
+            carry = 0;
             axis = 'unknown';
         };
 
@@ -483,27 +511,38 @@ export class Xterm {
                     return;
                 }
             }
-            const deltaY = lastY - y;
-            lastY = y;
-            if (deltaY === 0) return;
             // Content follows the finger, so dragging down shows what is above it: a wheel up.
-            target.dispatchEvent(
-                new WheelEvent('wheel', {
-                    deltaY,
-                    // Pixels. getLinesScrolled divides by the row height and carries the fraction.
-                    deltaMode: 0,
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: x,
-                    clientY: y,
-                })
-            );
+            carry += lastY - y;
+            lastY = y;
+            const step = TOUCH_SCROLL_LINES_PER_WHEEL * rowHeight();
+            let reported = false;
+            while (Math.abs(carry) >= step) {
+                const deltaY = carry > 0 ? step : -step;
+                carry -= deltaY;
+                target.dispatchEvent(
+                    new WheelEvent('wheel', {
+                        deltaY,
+                        // Pixels, which is what the finger actually measured. getLinesScrolled divides
+                        // by the row height, and the application's report takes its direction from the
+                        // sign of this value.
+                        deltaMode: 0,
+                        bubbles: true,
+                        cancelable: true,
+                        clientX: x,
+                        clientY: y,
+                    })
+                );
+                reported = true;
+            }
             // After the direction is known and the wheel is sent, never before: preventing a move that the
             // framing page still owns is exactly how the pane-to-pane swipe would break.
-            ev.preventDefault();
+            if (reported) ev.preventDefault();
         };
 
         const onEnd = () => {
+            // A gesture that ends mid-row leaves that remainder unspent, which is right: the next swipe
+            // starts where the screen is, not where the last finger was.
+            carry = 0;
             axis = 'unknown';
         };
 

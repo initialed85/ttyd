@@ -4,6 +4,13 @@
     <meta charset="UTF-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
     <meta name="apple-mobile-web-app-capable" content="yes">
+    <!-- Without this a phone lays the page out at its default 980px and then shrinks the whole thing to
+         fit the screen, so a direct agent URL on a 390pt phone renders at ~0.4 scale: the client's own
+         phone rules (the font size, the swipe that scrolls the pane) are running, and the browser then
+         draws them a third of the size they were chosen for. It is ignored inside an iframe, which is how
+         the nginx front frames a pane, so a page that is already laid out by the front's stylesheet pays
+         nothing for it. viewport-fit=cover so a notched phone gives the terminal the whole height. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title><%= htmlWebpackPlugin.options.title %></title>
     <link inline rel="icon" type="image/png" href="favicon.png">
     <% for (const css in htmlWebpackPlugin.files.css) { %>
