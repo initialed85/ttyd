@@ -48,7 +48,13 @@ type Preferences = ITerminalOptions & ClientOptions;
 // terminal, and the glyph is the same 12 CSS px it is on the desktop, which on a 3x display is 36
 // device px against a laptop's 12 - three times the size on the desktop's, and the same size on the
 // glass. This was 16, which made it four times; the user asked for about a third of it back and agreed
-// 12 as close enough.
+// 12 as close enough, then asked for one notch up.
+//
+// 13 is that notch, and it is cheaper than it looks. Measured on one terminal at one 390x844 viewport,
+// the character cell is 7x14 at 12, 7x15 at 13, 8x16 at 14 and 9x19 at 16: the advance only steps a
+// whole pixel at 14, so 12 and 13 both fill 52 columns while 14 falls to 45 and 16 to 40. Raising 12 to
+// 13 buys a taller line for the eye to track and costs no columns at all - the one notch available that
+// is not paid for in width.
 //
 // The pointer, not the width, is the trigger: the desktop grid makes every pane a ~60px cell, and a
 // rule keyed on the pane's own width would hand those cells the phone's font and a handful of columns.
@@ -58,7 +64,7 @@ type Preferences = ITerminalOptions & ClientOptions;
 // The number is pinned rather than left inherited, because the server's -t option is the desktop's:
 // raising an agent's fontSize moves every pane on the desktop and must not move the phone. The query
 // still wins, so `?fontSize=` is the escape hatch and the size is overridable per pane.
-const MOBILE_FONT_PX = 12;
+const MOBILE_FONT_PX = 13;
 
 // The other half of the same "is this a phone" question, asked once so the two rules cannot drift.
 const isCoarsePointer = (): boolean => window.matchMedia?.('(pointer: coarse)').matches === true;
@@ -75,9 +81,22 @@ const TOUCH_SCROLL_LOCK_PX = 10;
 // reports a gesture produces. Sending one per touchmove made that depend on the pointer's event rate:
 // the harness's 400px drag is 8 touchmoves and scrolled 35 lines, while a real finger covers the same
 // 400px in sixty or so and would have thrown the whole history past the person holding the phone.
-// Five rows per report makes a swipe travel about as far as the finger does, which is the half the
-// user asked for, and it is the same amount tmux moves per report so the two multiply to nothing.
-const TOUCH_SCROLL_LINES_PER_WHEEL = 5;
+// Five rows per report made a swipe travel about as far as the finger does, which is the half the user
+// asked for, and it was the same amount tmux moves per report so the two multiplied to nothing.
+//
+// Six, at the user's request for a touch faster, deliberately breaks that coincidence: a report is now
+// longer than the finger's row-for-row equivalence. It does so by producing fewer reports for the same
+// drag rather than by making each report louder, which keeps tmux's own five-row binding the only place
+// the step is set, and the step is computed from the live row height so it stays a whole number of rows
+// when the font changes.
+//
+// What it is not claimed to do is scroll a fixed amount further. The batch is measured in rows, so the
+// font bump above makes each report cover more pixels and a 400px drag therefore fires fewer of them:
+// 5.6 per drag at 12px against 5.2 at 13. One harness reading put the shipped client at 17 lines per
+// 400px drag in a less pane; the same harness refused to move at all on a rerun of the identical gesture
+// with the font overridden, so its arithmetic is not trustworthy and no product of these numbers is
+// asserted here. The phone is the instrument that will say whether six is faster, and by how much.
+const TOUCH_SCROLL_LINES_PER_WHEEL = 6;
 
 // What the server said it is willing to do. Reported once per connection, before any of it is offered
 // in the UI, so a readonly pane does not pretend a dropped file will land somewhere.
@@ -455,6 +474,10 @@ export class Xterm {
      * `bind-key -T copy-mode WheelUpPane`, which is the desktop's binding too. Rebinding the *root* table
      * was tried and measured to make no difference: a fresh container with the default bindings and a
      * fresh one with `WheelUpPane` rewritten both scrolled exactly 35 lines from the same gesture.
+     *
+     * The constant is 6 rather than 5 because the user then asked for a touch faster, and it went here
+     * for exactly the reason the paragraph above rules out the alternative: the only dial that moves a
+     * phone's swipe without moving a laptop's wheel.
      */
     @bind
     private initTouchScroll(): void {
