@@ -532,7 +532,14 @@ export class Xterm {
                 }
             }
             // Content follows the finger, so dragging down shows what is above it: a wheel up.
-            carry += lastY - y;
+            // Measured on the deployed front, and this sign was wrong before: with `lastY - y` a finger
+            // dragging UP produced deltaY +77, which xterm's `case 'wheel'` maps to CoreMouseAction.DOWN
+            // (=1) and the SGR encoder sends as `ESC[<65;..M` - a wheel *down*. tmux's root table then bound
+            // WheelDownPane, which at the bottom of the history does nothing, so the gesture that a thumb
+            // makes most (drag up to read older lines) scrolled nothing at all; only a downward drag moved
+            // the pane, and it moved it the wrong way. `y - lastY` gives drag-up a negative deltaY, which
+            // encodes as 64 (wheel up) and enters copy-mode as it should.
+            carry += y - lastY;
             lastY = y;
             const step = TOUCH_SCROLL_LINES_PER_WHEEL * rowHeight();
             let reported = false;
