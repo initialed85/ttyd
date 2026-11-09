@@ -81,22 +81,19 @@ const TOUCH_SCROLL_LOCK_PX = 10;
 // reports a gesture produces. Sending one per touchmove made that depend on the pointer's event rate:
 // the harness's 400px drag is 8 touchmoves and scrolled 35 lines, while a real finger covers the same
 // 400px in sixty or so and would have thrown the whole history past the person holding the phone.
-// Five rows per report made a swipe travel about as far as the finger does, which is the half the user
-// asked for, and it was the same amount tmux moves per report so the two multiplied to nothing.
+// Five rows per report, which is the number that ships, and the reason it is not six is worth writing
+// down because it was the opposite of the expectation. Measured on a live agent, 390x844 viewport, four
+// 400px drags: at 12px with a 5-row batch the client fired 5 reports per drag and the pane moved 17
+// lines; at 13px with a 6-row batch it fired 4 reports per drag and the pane moved 7.5 - less than half
+// as far, not "a touch faster". The mechanism is that a batch is measured in rows, so a taller font both
+// lengthens each report and thins them out, and one gesture lost a report without gaining stride.
 //
-// Six, at the user's request for a touch faster, deliberately breaks that coincidence: a report is now
-// longer than the finger's row-for-row equivalence. It does so by producing fewer reports for the same
-// drag rather than by making each report louder, which keeps tmux's own five-row binding the only place
-// the step is set, and the step is computed from the live row height so it stays a whole number of rows
-// when the font changes.
-//
-// What it is not claimed to do is scroll a fixed amount further. The batch is measured in rows, so the
-// font bump above makes each report cover more pixels and a 400px drag therefore fires fewer of them:
-// 5.6 per drag at 12px against 5.2 at 13. One harness reading put the shipped client at 17 lines per
-// 400px drag in a less pane; the same harness refused to move at all on a rerun of the identical gesture
-// with the font overridden, so its arithmetic is not trustworthy and no product of these numbers is
-// asserted here. The phone is the instrument that will say whether six is faster, and by how much.
-const TOUCH_SCROLL_LINES_PER_WHEEL = 6;
+// The rig's per-line readings are not stable enough to tune against: a rerun of the identical 13px/6-row
+// gesture moved the pane not at all, and 5 reports against tmux's own five-row WheelUpPane binding should
+// have been 25 lines rather than 17, so `less` was not taking the full stride either. What is trustworthy
+// is the direction. Raising the constant is deferred until a phone is in a hand, because on this evidence
+// the only adjustment that survives measurement is the one that does not move the pane backwards.
+const TOUCH_SCROLL_LINES_PER_WHEEL = 5;
 
 // What the server said it is willing to do. Reported once per connection, before any of it is offered
 // in the UI, so a readonly pane does not pretend a dropped file will land somewhere.
@@ -475,9 +472,9 @@ export class Xterm {
      * was tried and measured to make no difference: a fresh container with the default bindings and a
      * fresh one with `WheelUpPane` rewritten both scrolled exactly 35 lines from the same gesture.
      *
-     * The constant is 6 rather than 5 because the user then asked for a touch faster, and it went here
-     * for exactly the reason the paragraph above rules out the alternative: the only dial that moves a
-     * phone's swipe without moving a laptop's wheel.
+     * The step stayed at five rows. Six was tried, at the request for a touch faster, and measured a
+     * swipe going *shorter* instead (see the constant), because a report is a fraction of a drag rather
+     * than a fixed shove - a taller font already spends the gain. Raise it again with a phone in hand.
      */
     @bind
     private initTouchScroll(): void {
